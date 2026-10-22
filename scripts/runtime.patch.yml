@@ -1,0 +1,17 @@
+# Local proof-of-concept preferences, composed through the official --patch flag.
+- id: skill-office
+  config:
+    cli: false
+- id: session-log-deepseek
+  config:
+    enabled: false
+- id: ui-plugin-manager
+  config:
+    registryProbeEnabled: false
+- id: directory-picker
+  disabled: true
+- insert:
+    - id: directory-picker-browse
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: ui-directory-picker-browse
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
