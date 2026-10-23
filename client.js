@@ -130,15 +130,33 @@ var SplitController = class {
       const existing = this.snapshot.ids.length > 0 ? this.snapshot.ids : this.current !== void 0 && known.has(this.current) ? [this.current] : [];
       if (existing.length === 0) return;
       if (target !== void 0) {
-        const capacity = getSnapLayout(target.layout).cells.length;
-        const others = existing.filter((value) => value !== id).slice(-(capacity - 1));
-        if (others.length === 0) return;
-        const next2 = existing.includes(id) ? existing.filter((value) => value === id || others.includes(value)) : [...others, id];
-        const slots = Array(capacity).fill(null);
-        slots[target.slot] = id;
-        let index = 0;
-        for (let slot = 0; slot < slots.length && index < others.length; slot += 1) {
-          if (slot !== target.slot) slots[slot] = others[index++];
+        const placement = this.snapshot.placement;
+        let slots;
+        let next2;
+        if (placement?.layout === target.layout) {
+          slots = [...placement.slots];
+          const source = slots.indexOf(id);
+          const displaced = slots[target.slot];
+          if (source !== -1) {
+            slots[source] = displaced;
+          } else if (displaced !== null) {
+            const empty = slots.indexOf(null);
+            if (empty !== -1) slots[empty] = displaced;
+          }
+          slots[target.slot] = id;
+          next2 = existing.filter((value) => slots.includes(value));
+          if (!next2.includes(id)) next2.push(id);
+        } else {
+          const capacity = getSnapLayout(target.layout).cells.length;
+          const others = existing.filter((value) => value !== id).slice(-(capacity - 1));
+          if (others.length === 0) return;
+          next2 = existing.includes(id) ? existing.filter((value) => value === id || others.includes(value)) : [...others, id];
+          slots = Array(capacity).fill(null);
+          slots[target.slot] = id;
+          let index = 0;
+          for (let slot = 0; slot < slots.length && index < others.length; slot += 1) {
+            if (slot !== target.slot) slots[slot] = others[index++];
+          }
         }
         const limited2 = existing.some((value) => !next2.includes(value));
         this.stagePlacement({ ids: next2, placement: { layout: target.layout, slots }, ...limited2 ? { notice: "limit" } : {} });
@@ -448,6 +466,7 @@ var HistoryDrag = class {
   snapshot = {};
   origin;
   zone = null;
+  layoutZone = null;
   disposed = false;
   getSnapshot = () => this.snapshot;
   subscribe = (listener) => {
@@ -466,6 +485,9 @@ var HistoryDrag = class {
   };
   setZone = (element) => {
     this.zone = element;
+  };
+  setLayoutZone = (element) => {
+    this.layoutZone = element;
   };
   registerTarget = (element, target) => {
     if (this.disposed || !isSnapTarget(target)) return () => {
@@ -499,8 +521,10 @@ var HistoryDrag = class {
     this.targets.clear();
     this.listeners.clear();
     this.zone = null;
+    this.layoutZone = null;
   };
   pointerDown = (event) => {
+    this.cancel();
     this.origin = event.button === 0 ? { x: event.clientX, y: event.clientY, target: event.target } : void 0;
   };
   pointerUp = () => {
@@ -537,15 +561,27 @@ var HistoryDrag = class {
     const rect = zone.getBoundingClientRect();
     const { clientX: x, clientY: y } = event;
     if (!Number.isFinite(x) || !Number.isFinite(y) || rect.width <= 0 || rect.height <= 0 || x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) return {};
+    const grid = this.layoutZone?.getBoundingClientRect();
+    const bounds = grid && grid.width > 0 && grid.height > 0 ? grid : rect;
+    const area = bounds === rect ? void 0 : {
+      left: bounds.left - rect.left,
+      top: bounds.top - rect.top,
+      width: bounds.width,
+      height: bounds.height
+    };
     for (const [element, target] of this.targets) {
       if (!zone.contains(element) || !element.contains(event.target)) continue;
       const cell = element.getBoundingClientRect();
       if (x >= cell.left && x < cell.right && y >= cell.top && y < cell.bottom) {
-        return { picker: true, target };
+        return { picker: true, target, area };
       }
     }
     if (y < rect.top + PICKER_HEIGHT) return { picker: true };
-    return { target: { layout: "columns", slot: x < rect.left + rect.width / 2 ? 0 : 1 } };
+    const layout = getSnapLayout(this.dependencies.layout() ?? "columns");
+    const relativeX = (x - bounds.left) / bounds.width;
+    const relativeY = (y - bounds.top) / bounds.height;
+    const slot = layout.cells.findIndex((cell) => relativeX >= cell.x && relativeX < cell.x + cell.width && relativeY >= cell.y && relativeY < cell.y + cell.height);
+    return slot < 0 ? {} : { target: { layout: layout.id, slot }, area };
   }
   valid(id) {
     return this.dependencies.allowed() && this.dependencies.available(id);
@@ -568,7 +604,8 @@ var HistoryDrag = class {
     if (this.snapshot.id === void 0 || event.relatedTarget !== null) return;
     const { innerWidth, innerHeight } = this.dependencies.events;
     if (event.clientX <= 0 || event.clientY <= 0 || event.clientX >= innerWidth || event.clientY >= innerHeight) {
-      this.cancel();
+      const { id, left } = this.snapshot;
+      this.publish({ id, left });
     }
   };
   drop = (event) => {
@@ -583,7 +620,7 @@ var HistoryDrag = class {
   };
   publish(snapshot) {
     const previous = this.snapshot;
-    if (previous.id === snapshot.id && previous.left === snapshot.left && previous.picker === snapshot.picker && previous.target?.layout === snapshot.target?.layout && previous.target?.slot === snapshot.target?.slot) return;
+    if (previous.id === snapshot.id && previous.left === snapshot.left && previous.picker === snapshot.picker && previous.target?.layout === snapshot.target?.layout && previous.target?.slot === snapshot.target?.slot && previous.area?.left === snapshot.area?.left && previous.area?.top === snapshot.area?.top && previous.area?.width === snapshot.area?.width && previous.area?.height === snapshot.area?.height) return;
     this.snapshot = snapshot;
     for (const listener of this.listeners) listener();
   }
@@ -605,7 +642,7 @@ var dashboardStyles = `
 .dsh-snap-icon:focus-visible { outline:2px solid currentColor; outline-offset:2px; }
 .dsh-snap-message { display:flex; align-items:center; justify-content:center; flex:1; min-height:0; padding:24px; text-align:center; overflow-wrap:anywhere; font-size:13px; color:var(--dsw-alias-label-secondary); }
 .dsh-snap-notice { position:absolute; bottom:16px; right:16px; max-width:420px; padding:12px 16px; border:1px solid var(--dsw-alias-border-l4); border-radius:10px; background:var(--dsw-alias-bg-layer-2); color:var(--dsw-alias-label-primary); z-index:22; pointer-events:none; font-size:13px; }
-.dsh-snap-drop { position:fixed; top:0; bottom:0; right:0; z-index:30; pointer-events:auto; }
+.dsh-snap-drop { position:fixed; top:0; bottom:0; right:0; z-index:30; pointer-events:auto; -webkit-app-region:no-drag; }
 .dsh-snap-preview-surface { position:absolute; inset:0; pointer-events:none; }
 .dsh-snap-highlight { position:absolute; box-sizing:border-box; border:8px solid transparent; border-radius:20px; background:rgba(79,133,239,.19); background-clip:padding-box; pointer-events:none; }
 .dsh-snap-highlight::after { content:''; position:absolute; inset:0; border:2px solid #5686ef; border-radius:12px; box-shadow:inset 0 0 0 1px #ffffff55,0 4px 24px #315ba622; }
@@ -704,12 +741,12 @@ function SessionPane({ id, title, controller, SessionProvider, renderSlot, t, st
   }, [reference]);
   return /* @__PURE__ */ import_react.default.createElement("section", { className: "dsh-snap-pane", "aria-label": title, "data-snap-session": id, style }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-pane-tools" }, /* @__PURE__ */ import_react.default.createElement("button", { type: "button", className: "dsh-snap-icon", title: t("single"), "aria-label": `${t("single")}: ${title}`, onClick: () => controller.exit(id) }, "\u25A1"), /* @__PURE__ */ import_react.default.createElement("button", { type: "button", className: "dsh-snap-icon", title: t("close"), "aria-label": `${t("close")}: ${title}`, onClick: () => controller.close(id) }, "\xD7")), error !== void 0 ? /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-message", role: "alert" }, t("failed"), " ", error) : ready && reference !== void 0 ? /* @__PURE__ */ import_react.default.createElement(SessionProvider, { session: reference }, renderSlot(CHAT_SLOT, {})) : /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-message", role: "status" }, t("opening")));
 }
-function SplitView({ controller, useSessions, SessionProvider, renderSlot, t }) {
+function SplitView({ controller, historyDrag, useSessions, SessionProvider, renderSlot, t }) {
   const state = (0, import_react.useSyncExternalStore)(controller.subscribe, controller.getSnapshot);
   const catalog = useSessions((value) => value);
   const layout = state.placement && getSnapLayout(state.placement.layout);
   const cells = state.placement?.slots ?? state.ids;
-  return /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-grid", "aria-label": t("split"), "data-pane-count": state.ids.length, "data-snap-layout": layout?.id }, cells.map((id, index) => {
+  return /* @__PURE__ */ import_react.default.createElement("div", { ref: historyDrag.setLayoutZone, className: "dsh-snap-grid", "aria-label": t("split"), "data-pane-count": state.ids.length, "data-snap-layout": layout?.id }, cells.map((id, index) => {
     const rect = layout?.cells[index];
     const style = rect && gridCell(rect);
     return id === null ? /* @__PURE__ */ import_react.default.createElement("div", { key: `empty-${index}`, className: "dsh-snap-empty", style, "aria-label": t("empty") }, t("empty")) : /* @__PURE__ */ import_react.default.createElement(
@@ -772,7 +809,7 @@ function SplitStatus({ controller, historyDrag, t }) {
     const timer = window.setTimeout(() => setDismissed(notice), 6e3);
     return () => window.clearTimeout(timer);
   }, [notice, state.error]);
-  return /* @__PURE__ */ import_react.default.createElement(import_react.default.Fragment, null, /* @__PURE__ */ import_react.default.createElement("style", null, dashboardStyles), drag.id !== void 0 && /* @__PURE__ */ import_react.default.createElement("div", { ref: historyDrag.setZone, className: "dsh-snap-drop", style: { left: drag.left } }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-preview-surface", "aria-hidden": "true" }, preview && /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-highlight", style: previewCell(preview), "data-preview-layout": drag.target?.layout, "data-preview-slot": drag.target?.slot })), drag.picker ? /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-picker", role: "group", "aria-label": t("choose") }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-layouts" }, SNAP_LAYOUTS.map((layout) => /* @__PURE__ */ import_react.default.createElement("div", { key: layout.id, className: "dsh-snap-layout", title: t(layout.id) }, layout.cells.map((rect, slot) => /* @__PURE__ */ import_react.default.createElement(
+  return /* @__PURE__ */ import_react.default.createElement(import_react.default.Fragment, null, /* @__PURE__ */ import_react.default.createElement("style", null, dashboardStyles), drag.id !== void 0 && /* @__PURE__ */ import_react.default.createElement("div", { ref: historyDrag.setZone, className: "dsh-snap-drop", style: { left: drag.left } }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-preview-surface", "aria-hidden": "true", style: drag.area && { ...drag.area, right: "auto", bottom: "auto" } }, preview && /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-highlight", style: previewCell(preview), "data-preview-layout": drag.target?.layout, "data-preview-slot": drag.target?.slot })), drag.picker ? /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-picker", role: "group", "aria-label": t("choose") }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-layouts" }, SNAP_LAYOUTS.map((layout) => /* @__PURE__ */ import_react.default.createElement("div", { key: layout.id, className: "dsh-snap-layout", title: t(layout.id) }, layout.cells.map((rect, slot) => /* @__PURE__ */ import_react.default.createElement(
     LayoutCell,
     {
       key: slot,
@@ -811,6 +848,7 @@ function apply(ctx) {
   });
   const historyDrag = new HistoryDrag({
     events: window,
+    layout: () => controller.getSnapshot().placement?.layout,
     allowed: () => ctx.layout.panelInfo.getSnapshot().activePanelId === null,
     available: (id) => {
       const row = ctx.sessions.list.getSnapshot().byId[id];

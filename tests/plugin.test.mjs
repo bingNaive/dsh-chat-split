@@ -12,9 +12,21 @@ const translate = key => key;
 function loadBundle() {
   let loaded;
   const required = [];
+  const eventListeners = new Map();
+  const events = {
+    addEventListener(type, listener) {
+      const list = eventListeners.get(type) ?? new Set();
+      list.add(listener); eventListeners.set(type, list);
+    },
+    removeEventListener(type, listener) { eventListeners.get(type)?.delete(listener); },
+    emit(type, values) {
+      const event = { preventDefault() {}, stopPropagation() {}, ...values };
+      for (const listener of eventListeners.get(type) ?? []) listener(event);
+    },
+  };
   vm.runInNewContext(bundle, {
     window: { __ModuleLoader__: { load(value) { loaded = value; } }, setTimeout, clearTimeout,
-      addEventListener() {}, removeEventListener() {} },
+      ...events },
     console,
   }, { filename: 'client.js' });
   assert.ok(loaded, 'The official loader entry must be registered.');
@@ -23,7 +35,7 @@ function loadBundle() {
     assert.equal(name, 'react', 'Host implementation modules must not be runtime imports.');
     return React;
   });
-  return { loaded, required, activate };
+  return { loaded, required, activate, events };
 }
 
 function catalog() {
@@ -372,6 +384,11 @@ test('drag overlay highlights one target and only exposes layout choices during 
     assert.equal(renderer.root.findByProps({ className: 'dsh-snap-highlight' }).props.style.top, '50%');
     await act(async () => { update({ ...snapshot, target: undefined }); });
     assert.equal(renderer.root.findAllByProps({ className: 'dsh-snap-highlight' }).length, 0);
+    await act(async () => { update({ ...snapshot, picker: false, target: { layout: 'grid', slot: 1 },
+      area: { left: 20, top: 40, width: 800, height: 600 } }); });
+    assert.deepEqual({ ...renderer.root.findByProps({ className: 'dsh-snap-preview-surface' }).props.style },
+      { left: 20, top: 40, width: 800, height: 600, right: 'auto', bottom: 'auto' });
+    assert.equal(renderer.root.findByProps({ className: 'dsh-snap-highlight' }).props.style.height, '50%');
     await act(async () => { update({}); });
     assert.equal(targets.size, 0);
     assert.equal(zone, null);
@@ -380,4 +397,33 @@ test('drag overlay highlights one target and only exposes layout choices during 
     await act(async () => { renderer?.unmount(); });
     harness.dispose();
   }
+});
+
+test('history drag uses the selected layout through the plugin and fills its empty cell without moving existing panes', async () => {
+  const harness = setup();
+  try {
+    await act(async () => { harness.controller.addHistory('history', { layout: 'grid', slot: 3 }); });
+    harness.add('second-history', { blank: false });
+    const drag = harness.actions.historyDrag;
+    const marker = {};
+    const row = { contains: value => value === marker || value === row,
+      getBoundingClientRect: () => ({ right: 268 }) };
+    const zone = { contains: value => value === zone,
+      getBoundingClientRect: () => ({ left: 280, top: 0, right: 1280, bottom: 800, width: 1000, height: 800 }) };
+    drag.anchor(marker, 'second-history');
+    drag.setZone(zone);
+    const values = new Map();
+    const dataTransfer = { setData: (type, value) => values.set(type, value), getData: type => values.get(type) ?? '' };
+    harness.events.emit('pointerdown', { button: 0, target: marker, clientX: 60, clientY: 300 });
+    harness.events.emit('dragstart', { target: row, clientX: 80, clientY: 300, dataTransfer });
+    harness.events.emit('dragover', { target: zone, clientX: 500, clientY: 600, dataTransfer });
+    assert.equal(drag.getSnapshot().target.layout, 'grid');
+    assert.equal(drag.getSnapshot().target.slot, 2);
+    await act(async () => {
+      harness.events.emit('drop', { target: zone, clientX: 500, clientY: 600, dataTransfer });
+    });
+    assert.equal(harness.controller.getSnapshot().placement.layout, 'grid');
+    assert.deepEqual([...harness.controller.getSnapshot().placement.slots], ['alpha', null, 'second-history', 'history']);
+    assert.equal(harness.forbiddenRequests.length, 0);
+  } finally { harness.dispose(); }
 });

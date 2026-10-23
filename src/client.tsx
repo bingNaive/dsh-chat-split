@@ -86,12 +86,12 @@ function SessionPane({ id, title, controller, SessionProvider, renderSlot, t, st
         : <div className="dsh-snap-message" role="status">{t('opening')}</div>}
   </section>;
 }
-function SplitView({ controller, useSessions, SessionProvider, renderSlot, t }: SplitProps) {
+function SplitView({ controller, historyDrag, useSessions, SessionProvider, renderSlot, t }: SplitProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
   const catalog = useSessions(value => value);
   const layout = state.placement && getSnapLayout(state.placement.layout);
   const cells = state.placement?.slots ?? state.ids;
-  return <div className="dsh-snap-grid" aria-label={t('split')} data-pane-count={state.ids.length} data-snap-layout={layout?.id}>
+  return <div ref={historyDrag.setLayoutZone} className="dsh-snap-grid" aria-label={t('split')} data-pane-count={state.ids.length} data-snap-layout={layout?.id}>
     {cells.map((id, index) => {
       const rect = layout?.cells[index];
       const style = rect && gridCell(rect);
@@ -140,7 +140,7 @@ function SplitStatus({ controller, historyDrag, t }: Actions & Localized) {
   }, [notice, state.error]);
   return <><style>{dashboardStyles}</style>
     {drag.id !== undefined && <div ref={historyDrag.setZone} className="dsh-snap-drop" style={{ left: drag.left }}>
-      <div className="dsh-snap-preview-surface" aria-hidden="true">
+      <div className="dsh-snap-preview-surface" aria-hidden="true" style={drag.area && { ...drag.area, right: 'auto', bottom: 'auto' }}>
         {preview && <div className="dsh-snap-highlight" style={previewCell(preview)} data-preview-layout={drag.target?.layout} data-preview-slot={drag.target?.slot} />}
       </div>
       {drag.picker ? <div className="dsh-snap-picker" role="group" aria-label={t('choose')}>
@@ -175,6 +175,7 @@ export function apply(ctx: Context): void {
   });
   const historyDrag = new HistoryDrag({
     events: window,
+    layout: () => controller.getSnapshot().placement?.layout,
     allowed: () => ctx.layout.panelInfo.getSnapshot().activePanelId === null,
     available: id => {
       const row = ctx.sessions.list.getSnapshot().byId[id as SessionId];

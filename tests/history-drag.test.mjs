@@ -65,10 +65,11 @@ function fixture() {
   const dataTransfer = transfer();
   const available = new Set(['history']);
   let allowed = true;
+  let layout;
   const added = [];
   const placements = [];
   const drag = new HistoryDrag({
-    events, available: id => available.has(id), allowed: () => allowed,
+    events, available: id => available.has(id), allowed: () => allowed, layout: () => layout,
     add: (id, target) => { added.push(id); placements.push(target); },
   });
   const unanchor = drag.anchor(marker, 'history');
@@ -76,6 +77,7 @@ function fixture() {
   return {
     events, drag, title, marker, row, zone, preview, outside, dataTransfer, available, added, placements, unanchor,
     setAllowed(value) { allowed = value; },
+    setLayout(value) { layout = value; },
     down(values = {}) { return events.emit('pointerdown', { target: title, clientX: 60, clientY: 100, ...values }); },
     start(values = {}, nativeHandler) {
       return events.emit('dragstart', { target: row, clientX: 80, clientY: 102, dataTransfer, ...values }, nativeHandler);
@@ -282,6 +284,93 @@ test('left and right halves preview and place exactly at the horizontal seam', (
   }
 });
 
+test('subsequent drags use all four current grid cells, including both horizontal and vertical seams', () => {
+  for (const [x, y, slot] of [
+    [500, 200, 0], [1000, 200, 1], [500, 600, 2], [1000, 600, 3],
+    [779.9, 399.9, 0], [780, 399.9, 1], [779.9, 400, 2], [780, 400, 3],
+  ]) {
+    const f = fixture();
+    f.setLayout('grid');
+    f.begin();
+    f.over({ clientX: x, clientY: y });
+    assert.deepEqual(f.drag.getSnapshot().target, { layout: 'grid', slot });
+    f.drop({ clientX: x, clientY: y });
+    assert.deepEqual(f.placements, [{ layout: 'grid', slot }]);
+    f.drag.dispose();
+  }
+});
+
+test('body placement follows the selected unequal, three-column and stacked layouts', () => {
+  for (const [layout, points] of [
+    ['wide-left', [[900, 300, 0], [1100, 300, 1]]],
+    ['wide-right', [[500, 300, 0], [700, 300, 1]]],
+    ['three-columns', [[500, 300, 0], [800, 300, 1], [1100, 300, 2]]],
+    ['left-stack', [[500, 600, 0], [1000, 200, 1], [1000, 600, 2]]],
+  ]) {
+    for (const [x, y, slot] of points) {
+      const f = fixture();
+      f.setLayout(layout);
+      f.begin();
+      f.over({ clientX: x, clientY: y });
+      assert.deepEqual(f.drag.getSnapshot().target, { layout, slot });
+      f.drop({ clientX: x, clientY: y });
+      assert.deepEqual(f.placements, [{ layout, slot }]);
+      f.drag.dispose();
+    }
+  }
+});
+
+test('drop reads the current layout again, and returning to a single chat restores default halves', () => {
+  const f = fixture();
+  f.setLayout('grid');
+  f.begin();
+  f.over({ clientX: 1000, clientY: 600 });
+  assert.deepEqual(f.drag.getSnapshot().target, { layout: 'grid', slot: 3 });
+  f.setLayout('left-stack');
+  f.drop({ clientX: 1000, clientY: 600 });
+  assert.deepEqual(f.placements, [{ layout: 'left-stack', slot: 2 }]);
+  f.setLayout(undefined);
+  f.begin();
+  f.drop({ clientX: 1000, clientY: 600 });
+  assert.deepEqual(f.placements[1], { layout: 'columns', slot: 1 });
+  f.drag.dispose();
+});
+
+test('a selected grid still permits an explicit layout change from the top picker', () => {
+  const f = fixture();
+  f.setLayout('grid');
+  const target = { layout: 'wide-left', slot: 1 };
+  const { child } = f.cell(target, { left: 400, right: 450, top: 24, bottom: 80 });
+  f.begin();
+  f.over({ target: child, clientX: 420, clientY: 50 });
+  assert.deepEqual(f.drag.getSnapshot().target, target);
+  f.drop({ target: child, clientX: 420, clientY: 50 });
+  assert.deepEqual(f.placements, [target]);
+  f.drag.dispose();
+});
+
+test('grid hit testing and preview share the rendered area below the titlebar and update after resizing', () => {
+  const f = fixture();
+  f.setLayout('grid');
+  const grid = element();
+  grid.setRect({ left: 300, top: 60, right: 1280, bottom: 800 });
+  f.drag.setLayoutZone(grid);
+  f.begin();
+  f.over({ clientX: 500, clientY: 420 });
+  assert.deepEqual(f.drag.getSnapshot().target, { layout: 'grid', slot: 0 }, 'Use the visible grid midpoint at 430, not the overlay midpoint at 400.');
+  assert.deepEqual(f.drag.getSnapshot().area, { left: 20, top: 60, width: 980, height: 740 });
+  grid.setRect({ bottom: 700 });
+  f.over({ clientX: 500, clientY: 420 });
+  assert.deepEqual(f.drag.getSnapshot().area, { left: 20, top: 60, width: 980, height: 640 });
+  f.drop({ clientX: 500, clientY: 420 });
+  assert.deepEqual(f.placements, [{ layout: 'grid', slot: 2 }]);
+  f.begin();
+  f.drop({ clientX: 290, clientY: 300 });
+  assert.equal(f.placements.length, 1, 'Space outside the rendered grid is not a cell.');
+  f.drag.setLayoutZone(null);
+  f.drag.dispose();
+});
+
 test('top strip shows the layout picker but whitespace never accepts a drop', () => {
   for (const [x, y] of [[280, 0], [500, 10], [1100, 70], [600, 123.9]]) {
     const f = fixture();
@@ -457,7 +546,7 @@ test('missing transfer or permission/session changes cancel active previews safe
   drop.drag.dispose();
 });
 
-test('true window exit cancels, while dragleave between descendants does not flicker', () => {
+test('dragleave between descendants does not flicker', () => {
   const f = fixture();
   f.begin();
   f.over();
@@ -466,10 +555,78 @@ test('true window exit cancels, while dragleave between descendants does not fli
   assert.equal(f.drag.getSnapshot(), before);
   f.events.emit('dragleave', { target: f.preview, relatedTarget: null, clientX: 500, clientY: 300 });
   assert.equal(f.drag.getSnapshot(), before);
-  f.events.emit('dragleave', { relatedTarget: null, clientX: 1280, clientY: 300 });
-  assert.deepEqual(f.drag.getSnapshot(), {});
-  f.drop();
+  f.drag.dispose();
+});
+
+test('leaving for window chrome preserves the gesture and returning resumes directional placement', () => {
+  for (const point of [
+    { clientX: 500, clientY: 0 }, { clientX: 500, clientY: -20 },
+    { clientX: 0, clientY: 300 }, { clientX: 1280, clientY: 300 },
+    { clientX: 500, clientY: 800 }, { clientX: 0, clientY: 0 },
+  ]) {
+    const f = fixture();
+    f.begin();
+    f.over({ clientX: 500, clientY: 300 });
+    const left = f.drag.getSnapshot().left;
+    f.events.emit('dragleave', { relatedTarget: null, ...point });
+    assert.deepEqual(f.drag.getSnapshot(), { id: 'history', left });
+    assert.deepEqual(f.added, [], 'Leaving the renderer cannot commit a placement.');
+    f.over({ clientX: 1000, clientY: 300 });
+    assert.deepEqual(f.drag.getSnapshot().target, { layout: 'columns', slot: 1 });
+    f.drop({ clientX: 1000, clientY: 300 });
+    assert.deepEqual(f.placements, [{ layout: 'columns', slot: 1 }]);
+    f.drag.dispose();
+  }
+});
+
+test('a drag can cross the top edge repeatedly and return to a layout cell without restarting', () => {
+  const f = fixture();
+  const target = { layout: 'grid', slot: 3 };
+  const { child } = f.cell(target, { left: 400, right: 450, top: 24, bottom: 80 });
+  f.begin();
+  for (let pass = 0; pass < 3; pass += 1) {
+    f.over({ target: child, clientX: 420, clientY: 50 });
+    assert.deepEqual(f.drag.getSnapshot().target, target);
+    f.events.emit('dragleave', { relatedTarget: null, clientX: 420, clientY: 0 });
+    assert.equal(f.drag.getSnapshot().target, undefined);
+    assert.equal(f.drag.getSnapshot().picker, undefined);
+    assert.equal(f.drag.getSnapshot().id, 'history');
+  }
+  f.over({ clientX: 500, clientY: 10 });
+  assert.equal(f.drag.getSnapshot().picker, true);
+  f.over({ target: child, clientX: 420, clientY: 50 });
+  f.drop({ target: child, clientX: 420, clientY: 50 });
+  assert.deepEqual(f.placements, [target]);
+  f.drag.dispose();
+});
+
+test('ending or cancelling outside the renderer never revives the old drag on return', () => {
+  for (const [type, values] of [
+    ['dragend', {}], ['keydown', { key: 'Escape' }], ['blur', {}],
+    ['pointerdown', { target: null }],
+  ]) {
+    const f = fixture();
+    f.begin();
+    f.over();
+    f.events.emit('dragleave', { clientX: 500, clientY: 0 });
+    f.events.emit(type, values);
+    assert.deepEqual(f.drag.getSnapshot(), {});
+    f.over();
+    f.drop();
+    assert.deepEqual(f.added, [], type);
+    assert.deepEqual(f.drag.getSnapshot(), {});
+    f.drag.dispose();
+  }
+});
+
+test('release outside after leaving cannot commit the previously highlighted region', () => {
+  const f = fixture();
+  f.begin();
+  f.over();
+  f.events.emit('dragleave', { clientX: 500, clientY: 0 });
+  f.drop({ target: f.outside, clientX: 500, clientY: -20 });
   assert.deepEqual(f.added, []);
+  assert.deepEqual(f.drag.getSnapshot(), {});
   f.drag.dispose();
 });
 

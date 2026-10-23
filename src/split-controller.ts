@@ -101,16 +101,35 @@ export class SplitController {
         : this.current !== undefined && known.has(this.current) ? [this.current] : [];
       if (existing.length === 0) return;
       if (target !== undefined) {
-        const capacity = getSnapLayout(target.layout).cells.length;
-        const others = existing.filter(value => value !== id).slice(-(capacity - 1));
-        if (others.length === 0) return;
-        const next = existing.includes(id)
-          ? existing.filter(value => value === id || others.includes(value)) : [...others, id];
-        const slots: (string | null)[] = Array(capacity).fill(null);
-        slots[target.slot] = id;
-        let index = 0;
-        for (let slot = 0; slot < slots.length && index < others.length; slot += 1) {
-          if (slot !== target.slot) slots[slot] = others[index++]!;
+        const placement = this.snapshot.placement;
+        let slots: (string | null)[];
+        let next: string[];
+        if (placement?.layout === target.layout) {
+          slots = [...placement.slots];
+          const source = slots.indexOf(id);
+          const displaced = slots[target.slot]!;
+          if (source !== -1) {
+            // Moving a visible pane swaps it with the destination, including an empty slot.
+            slots[source] = displaced;
+          } else if (displaced !== null) {
+            const empty = slots.indexOf(null);
+            if (empty !== -1) slots[empty] = displaced;
+          }
+          slots[target.slot] = id;
+          next = existing.filter(value => slots.includes(value));
+          if (!next.includes(id)) next.push(id);
+        } else {
+          const capacity = getSnapLayout(target.layout).cells.length;
+          const others = existing.filter(value => value !== id).slice(-(capacity - 1));
+          if (others.length === 0) return;
+          next = existing.includes(id)
+            ? existing.filter(value => value === id || others.includes(value)) : [...others, id];
+          slots = Array(capacity).fill(null);
+          slots[target.slot] = id;
+          let index = 0;
+          for (let slot = 0; slot < slots.length && index < others.length; slot += 1) {
+            if (slot !== target.slot) slots[slot] = others[index++]!;
+          }
         }
         const limited = existing.some(value => !next.includes(value));
         this.stagePlacement({ ids: next, placement: { layout: target.layout, slots }, ...(limited ? { notice: 'limit' as const } : {}) });

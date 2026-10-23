@@ -599,6 +599,115 @@ test('targeted drop starts with native current draft and retains empty layout sl
   f.controller.dispose();
 });
 
+test('dropping history into an empty grid slot preserves the other pane positions', async () => {
+  const f = fixture();
+  f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  const original = f.controller.ref('history');
+  f.add('other-history', false);
+  f.controller.addHistory('other-history', { layout: 'grid', slot: 2 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'history', 'other-history'],
+    placement: { layout: 'grid', slots: ['alpha', null, 'other-history', 'history'] },
+  });
+  assert.equal(f.controller.ref('history'), original);
+  assert.equal(f.events.some(event => event[0] === 'open'), false);
+  f.controller.dispose();
+});
+
+test('moving visible grid panes uses empty slots or swaps occupied slots without changing recency', async () => {
+  const f = fixture();
+  f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  const records = [...f.records];
+  f.controller.addHistory('alpha', { layout: 'grid', slot: 2 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'history'], placement: { layout: 'grid', slots: [null, null, 'alpha', 'history'] },
+  });
+  f.controller.addHistory('alpha', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  const expected = {
+    ids: ['alpha', 'history'], placement: { layout: 'grid', slots: [null, null, 'history', 'alpha'] },
+  };
+  assert.deepEqual(f.controller.getSnapshot(), expected);
+  f.controller.addHistory('alpha', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), expected);
+  assert.deepEqual(f.records, records);
+  assert.ok(records.every(record => record.releases === 0));
+  f.controller.dispose();
+});
+
+test('new history displaces only the target pane into an available slot in the current layout', async () => {
+  for (const layout of ['grid', 'three-columns', 'left-stack']) {
+    const f = fixture();
+    const slot = layout === 'grid' ? 3 : 2;
+    f.controller.addHistory('history', { layout, slot });
+    await settlePlacement();
+    const original = f.controller.ref('history');
+    f.add('other-history', false);
+    f.controller.addHistory('other-history', { layout, slot });
+    await settlePlacement();
+    assert.deepEqual(f.controller.getSnapshot(), {
+      ids: ['alpha', 'history', 'other-history'],
+      placement: { layout, slots: layout === 'grid'
+        ? ['alpha', 'history', null, 'other-history'] : ['alpha', 'history', 'other-history'] },
+    });
+    assert.equal(f.controller.ref('history'), original);
+    assert.deepEqual(f.held, ['alpha', 'history', 'other-history']);
+    f.controller.dispose();
+  }
+});
+
+test('dropping into a full layout replaces the selected pane and preserves all other slots', async () => {
+  const f = fixture();
+  for (const id of ['beta', 'gamma']) f.newSession(id);
+  f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  const originals = new Map(f.controller.getSnapshot().ids.map(id => [id, f.controller.ref(id)]));
+  f.add('other-history', false);
+  f.controller.addHistory('other-history', { layout: 'grid', slot: 1 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'gamma', 'history', 'other-history'],
+    placement: { layout: 'grid', slots: ['alpha', 'other-history', 'gamma', 'history'] },
+    notice: 'limit',
+  });
+  assert.deepEqual(f.held, ['alpha', 'gamma', 'history', 'other-history']);
+  for (const id of ['alpha', 'gamma', 'history']) assert.equal(f.controller.ref(id), originals.get(id));
+  assert.equal(f.records.find(record => record.id === 'beta').releases, 1);
+  assert.equal(f.catalog.sessions.some(value => value.id === 'beta'), true);
+  assert.equal(f.events.some(event => event[0] === 'open'), false);
+  f.controller.dispose();
+});
+
+test('failed drops within the current layout roll back both displacement and staged references', async () => {
+  for (const failure of ['retain', 'readiness']) {
+    const f = fixture({ reentrant: true });
+    f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+    await settlePlacement();
+    const before = f.controller.getSnapshot();
+    const originals = new Map(before.ids.map(id => [id, f.controller.ref(id)]));
+    f.add('other-history', false);
+    const ready = deferred();
+    if (failure === 'retain') f.failures.set('other-history', new Error('load failed'));
+    else f.readiness.set('other-history', ready);
+    f.controller.addHistory('other-history', { layout: 'grid', slot: 3 });
+    if (failure === 'readiness') {
+      assert.equal(f.controller.getSnapshot(), before);
+      ready.reject(new Error('load failed'));
+    }
+    await settlePlacement();
+    assert.deepEqual(f.controller.getSnapshot(), { ...before, error: 'load failed' });
+    assert.deepEqual(f.held, ['alpha', 'history']);
+    for (const [id, reference] of originals) assert.equal(f.controller.ref(id), reference);
+    f.controller.dispose();
+    assert.ok(f.records.every(record => record.releases === 1));
+  }
+});
+
 test('targeting a visible conversation moves it without changing recency or duplicating references', async () => {
   const f = fixture();
   for (const id of ['beta', 'gamma', 'delta']) f.newSession(id);

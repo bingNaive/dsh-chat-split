@@ -1,6 +1,6 @@
 {
   "name": "@local/deepseek-multi-agent-dashboard",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "dsh-chat-split: split chats with New Session or by dragging history in DeepSeek Harness.",
   "private": true,
   "type": "module",

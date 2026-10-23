@@ -14,7 +14,7 @@ export const dashboardStyles = `
 .dsh-snap-icon:focus-visible { outline:2px solid currentColor; outline-offset:2px; }
 .dsh-snap-message { display:flex; align-items:center; justify-content:center; flex:1; min-height:0; padding:24px; text-align:center; overflow-wrap:anywhere; font-size:13px; color:var(--dsw-alias-label-secondary); }
 .dsh-snap-notice { position:absolute; bottom:16px; right:16px; max-width:420px; padding:12px 16px; border:1px solid var(--dsw-alias-border-l4); border-radius:10px; background:var(--dsw-alias-bg-layer-2); color:var(--dsw-alias-label-primary); z-index:22; pointer-events:none; font-size:13px; }
-.dsh-snap-drop { position:fixed; top:0; bottom:0; right:0; z-index:30; pointer-events:auto; }
+.dsh-snap-drop { position:fixed; top:0; bottom:0; right:0; z-index:30; pointer-events:auto; -webkit-app-region:no-drag; }
 .dsh-snap-preview-surface { position:absolute; inset:0; pointer-events:none; }
 .dsh-snap-highlight { position:absolute; box-sizing:border-box; border:8px solid transparent; border-radius:20px; background:rgba(79,133,239,.19); background-clip:padding-box; pointer-events:none; }
 .dsh-snap-highlight::after { content:''; position:absolute; inset:0; border:2px solid #5686ef; border-radius:12px; box-shadow:inset 0 0 0 1px #ffffff55,0 4px 24px #315ba622; }
