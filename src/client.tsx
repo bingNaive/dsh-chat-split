@@ -11,6 +11,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import { SplitController } from './split-controller.js';
 import { HistoryDrag } from './history-drag.js';
+import { isWorkspaceChoice, supersedesWorkspaceChoice } from './workspace-switch.js';
 import { dashboardStyles } from './styles.js';
 import { SNAP_LAYOUTS, getSnapLayout, type SnapRect, type SnapTarget } from './snap-layout.js';
 
@@ -76,7 +77,10 @@ function SessionPane({ id, title, controller, SessionProvider, renderSlot, t, st
     void reference?.ready.then(() => { if (live) setReady(true); }).catch((failure: unknown) => { if (live) setError(String(failure)); });
     return () => { live = false; };
   }, [reference]);
-  return <section className="dsh-snap-pane" aria-label={title} data-snap-session={id} style={style}>
+  return <section className="dsh-snap-pane" aria-label={title} data-snap-session={id} style={style}
+    onClickCapture={event => {
+      if (isWorkspaceChoice(event.currentTarget, event.target)) controller.beginWorkspaceChange(id);
+    }}>
     <div className="dsh-snap-pane-tools">
       <button type="button" className="dsh-snap-icon" title={t('single')} aria-label={`${t('single')}: ${title}`} onClick={() => controller.exit(id)}>□</button>
       <button type="button" className="dsh-snap-icon" title={t('close')} aria-label={`${t('close')}: ${title}`} onClick={() => controller.close(id)}>×</button>
@@ -164,6 +168,7 @@ export function apply(ctx: Context): void {
       const list = ctx.sessions.list.getSnapshot();
       return { ready: list.phase === 'ready', sessions: Object.values(list.byId).map(row => ({
         id: row.id, blank: row.blank && row.origin !== 'subagent', mainView: (row.retainedBy.mainView ?? 0) > 0,
+        mainViewCount: row.retainedBy.mainView ?? 0,
       })) };
     },
     subscribeCatalog: callback => ctx.sessions.list.subscribe(callback),
@@ -184,6 +189,22 @@ export function apply(ctx: Context): void {
     add: (id, target) => controller.addHistory(id, target),
   });
   actions = { controller, historyDrag };
+  ctx.effect(() => {
+    // Window capture precedes the pane's React capture, including portal menus.
+    const click = (event: MouseEvent) => {
+      if (supersedesWorkspaceChoice(event.target)) controller.cancelWorkspaceChange();
+    };
+    const key = (event: KeyboardEvent) => {
+      const navigate = (event.ctrlKey || event.metaKey) && ['KeyN', 'KeyK', 'KeyO'].includes(event.code);
+      if (event.key === 'Escape' || navigate) controller.cancelWorkspaceChange();
+    };
+    window.addEventListener('click', click, true);
+    window.addEventListener('keydown', key, true);
+    return () => {
+      window.removeEventListener('click', click, true);
+      window.removeEventListener('keydown', key, true);
+    };
+  }, 'split: workspace navigation intent');
   ctx.effect(() => () => historyDrag.dispose(), 'split: history drag lifetime');
   ctx.effect(() => () => controller.dispose(), 'split: controller lifetime');
   ctx.slots.inject(CHAT_SLOT, () => ctx.slots.register({ name: CHAT_SLOT, locale: NS }, EmbeddedChat));

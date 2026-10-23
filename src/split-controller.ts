@@ -10,6 +10,8 @@ export interface CatalogSession {
   /** Whether this row is eligible as a new empty conversation. */
   readonly blank: boolean;
   readonly mainView: boolean;
+  /** Native selection briefly holds two references, even when reopening its current draft. */
+  readonly mainViewCount?: number;
 }
 
 export interface SplitCatalog {
@@ -38,6 +40,20 @@ function message(failure: unknown): string {
   return failure instanceof Error ? failure.message : String(failure);
 }
 
+function mainViewCount(row: CatalogSession): number {
+  return row.mainViewCount ?? (row.mainView ? 1 : 0);
+}
+
+interface WorkspaceChange {
+  readonly sourceId: string;
+  readonly counts: ReadonlyMap<string, number>;
+  readonly previousReferences: ReadonlySet<string>;
+  readonly initialCurrent: string | undefined;
+  target?: string;
+  reference?: SplitReference;
+  ready?: boolean;
+}
+
 /** Observe native session creation and own conversation lifetimes across view changes. */
 export class SplitController {
   private snapshot: SplitSnapshot = { ids: [] };
@@ -54,6 +70,8 @@ export class SplitController {
   private resync = false;
   private disposed = false;
   private pendingPlacement: { readonly previousReferences: ReadonlySet<string> } | undefined;
+  private workspaceChange: WorkspaceChange | undefined;
+  private cancelledWorkspaceTarget: { readonly id: string; retainedAgain: boolean } | undefined;
 
   constructor(private readonly dependencies: SplitDependencies) {
     this.syncCatalog();
@@ -79,17 +97,53 @@ export class SplitController {
       do {
         this.resync = false;
         try { this.readCatalog(this.dependencies.catalog()); }
-        catch (failure) { this.fail(message(failure)); }
+        catch (failure) { this.clearWorkspaceChange(); this.fail(message(failure)); }
       } while (this.resync && !this.disposed);
     } finally { this.busy = false; }
+  };
+
+  /** Scope the next native workspace selection to the pane that opened its picker. */
+  readonly beginWorkspaceChange = (sourceId: string): void => {
+    if (this.disposed || this.busy || this.nativeTarget !== undefined) return;
+    this.run(() => {
+      this.cancelledWorkspaceTarget = undefined;
+      this.clearWorkspaceChange();
+      if (!this.snapshot.ids.includes(sourceId)) return;
+      // A preceding drag must not commit while native beforeOpen migrates the draft.
+      this.cancelPlacement();
+      const catalog = this.dependencies.catalog();
+      this.workspaceChange = {
+        sourceId,
+        counts: new Map(catalog.sessions.map(row => [row.id, mainViewCount(row)])),
+        previousReferences: new Set(this.references.keys()),
+        initialCurrent: this.current,
+      };
+    });
+  };
+
+  readonly cancelWorkspaceChange = (): void => {
+    if (this.disposed || this.busy) return;
+    this.run(() => {
+      const pending = this.workspaceChange;
+      if (pending?.target !== undefined && pending.target === this.current && !this.snapshot.ids.includes(pending.target)) {
+        // Native selection already moved, but this pane is still waiting for its
+        // reference. A later explicit re-open must be treated as navigation even
+        // though native selection keeps the same id. Our own release notification
+        // is not that re-open: wait for its next native retain/release pair.
+        this.cancelledWorkspaceTarget = { id: pending.target, retainedAgain: false };
+      }
+      this.clearWorkspaceChange();
+    });
   };
 
   /** Add an explicitly dropped conversation without changing native selection. */
   readonly addHistory = (id: string, target?: SnapTarget): void => {
     if (this.disposed || this.busy || this.nativeTarget !== undefined) return;
     if (target !== undefined && (!target || !isSnapTarget(target))) return;
-    if (target === undefined && this.snapshot.ids.includes(id)) return;
     this.run(() => {
+      this.cancelledWorkspaceTarget = undefined;
+      this.clearWorkspaceChange();
+      if (target === undefined && this.snapshot.ids.includes(id)) return;
       const catalog = this.dependencies.catalog();
       if (!catalog.ready) return;
       const known = new Set(catalog.sessions.map(row => row.id));
@@ -157,6 +211,8 @@ export class SplitController {
   readonly close = (id: string): void => {
     if (this.disposed || this.busy || !this.snapshot.ids.includes(id)) return;
     this.run(() => {
+      this.cancelledWorkspaceTarget = undefined;
+      this.clearWorkspaceChange();
       this.cancelPlacement();
       const remaining = this.snapshot.ids.filter(value => value !== id);
       if (remaining.length < 2) {
@@ -178,6 +234,8 @@ export class SplitController {
   readonly exit = (id?: string): void => {
     if (this.disposed || this.busy) return;
     this.run(() => {
+      this.cancelledWorkspaceTarget = undefined;
+      this.clearWorkspaceChange();
       const target = id ?? (this.current !== undefined && this.snapshot.ids.includes(this.current)
         ? this.current : this.snapshot.ids[0] ?? this.current);
       if (target !== undefined && !this.dependencies.catalog().sessions.some(row => row.id === target)) {
@@ -192,6 +250,8 @@ export class SplitController {
   readonly dispose = (): void => {
     if (this.disposed) return;
     this.disposed = true;
+    this.cancelledWorkspaceTarget = undefined;
+    this.clearWorkspaceChange();
     this.cancelPlacement();
     const unsubscribe = this.unsubscribeCatalog;
     this.unsubscribeCatalog = undefined;
@@ -221,7 +281,19 @@ export class SplitController {
         if (rows.get(candidate)?.blank !== true) this.candidates.delete(candidate);
       }
     }
-    const main = catalog.sessions.filter(row => row.mainView);
+    const main = catalog.sessions.filter(row => mainViewCount(row) > 0);
+    if (this.workspaceChange !== undefined && this.readWorkspaceChange(catalog, main)) return;
+    const cancelled = this.cancelledWorkspaceTarget;
+    if (cancelled !== undefined) {
+      if (main.some(row => row.id === cancelled.id && mainViewCount(row) > 1)) cancelled.retainedAgain = true;
+      if (main.length === 1 && mainViewCount(main[0]!) === 1) {
+        if (main[0]!.id !== cancelled.id) this.cancelledWorkspaceTarget = undefined;
+        else if (cancelled.retainedAgain) {
+          this.cancelledWorkspaceTarget = undefined;
+          this.current = undefined;
+        }
+      }
+    }
     // Native selection retains the incoming reference before releasing the old one.
     const selected = main.some(row => row.id === this.current)
       ? this.current : main.length === 1 ? main[0]!.id : undefined;
@@ -298,6 +370,77 @@ export class SplitController {
     this.restore();
     this.publish(error === undefined ? { ids: [] } : { ids: [], error });
     if (retained) this.releaseExcept(new Set([selected]));
+  }
+
+  private readWorkspaceChange(catalog: SplitCatalog, main: readonly CatalogSession[]): boolean {
+    const pending = this.workspaceChange!;
+    if (!catalog.ready) return true;
+    if (!this.snapshot.ids.includes(pending.sourceId)) {
+      this.clearWorkspaceChange();
+      return false;
+    }
+    // Retain happens before native beforeOpen, selection.set and old-reference release.
+    // Its count increase also identifies a destination that is already current.
+    const incoming = main.find(row => mainViewCount(row) > (pending.counts.get(row.id) ?? 0));
+    pending.target ??= incoming?.id;
+    if (pending.target !== undefined && !catalog.sessions.some(row => row.id === pending.target)) {
+      this.clearWorkspaceChange();
+      this.candidates.clear();
+      if (main.length === 1 && mainViewCount(main[0]!) === 1) this.current = main[0]!.id;
+      this.fail('This conversation is no longer available.');
+      return true;
+    }
+    if (main.length !== 1 || mainViewCount(main[0]!) !== 1) return true;
+    const selected = main[0]!.id;
+    if (pending.target === undefined && selected !== pending.initialCurrent) pending.target = selected;
+    if (pending.target === undefined) return true;
+    if (selected !== pending.target) {
+      // Its temporary native reference was released: navigation either rolled
+      // back or was superseded. Do not let the old picker consume a later New.
+      this.clearWorkspaceChange();
+      this.candidates.clear();
+      return false;
+    }
+    this.current = selected;
+    this.candidates.clear();
+    if (selected === pending.sourceId) {
+      this.clearWorkspaceChange();
+      return true;
+    }
+    if (pending.reference === undefined) {
+      if (!this.acquire([selected])) {
+        this.clearWorkspaceChange();
+        return true;
+      }
+      pending.reference = this.references.get(selected)!;
+      void pending.reference.ready.then(() => {
+        if (this.disposed || this.workspaceChange !== pending) return;
+        pending.ready = true;
+        this.syncCatalog();
+      }, (failure: unknown) => {
+        if (this.disposed || this.workspaceChange !== pending) return;
+        this.run(() => { this.clearWorkspaceChange(); this.fail(message(failure)); });
+      });
+    }
+    if (!pending.ready) return true;
+    const visible = this.snapshot.ids.includes(selected);
+    const replace = (id: string | null): string | null => id === pending.sourceId ? selected
+      : visible && id === selected ? pending.sourceId : id;
+    const placement = this.snapshot.placement;
+    const ids = visible && placement ? this.snapshot.ids : this.snapshot.ids.map(id => replace(id)!);
+    this.workspaceChange = undefined;
+    this.publish({ ids, ...(placement ? {
+      placement: { layout: placement.layout, slots: placement.slots.map(replace) },
+    } : {}) });
+    this.releaseExcept(new Set(ids));
+    return true;
+  }
+
+  private clearWorkspaceChange(): void {
+    const pending = this.workspaceChange;
+    if (pending === undefined) return;
+    this.workspaceChange = undefined;
+    this.releaseExcept(pending.previousReferences);
   }
 
   private returnNative(target: string | undefined, navigate: boolean): void {

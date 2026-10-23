@@ -63,6 +63,9 @@ function isSnapTarget(value) {
 function message(failure) {
   return failure instanceof Error ? failure.message : String(failure);
 }
+function mainViewCount(row) {
+  return row.mainViewCount ?? (row.mainView ? 1 : 0);
+}
 var SplitController = class {
   constructor(dependencies) {
     this.dependencies = dependencies;
@@ -84,6 +87,8 @@ var SplitController = class {
   resync = false;
   disposed = false;
   pendingPlacement;
+  workspaceChange;
+  cancelledWorkspaceTarget;
   getSnapshot = () => this.snapshot;
   subscribe = (listener) => {
     if (this.disposed) return () => {
@@ -107,6 +112,7 @@ var SplitController = class {
         try {
           this.readCatalog(this.dependencies.catalog());
         } catch (failure) {
+          this.clearWorkspaceChange();
           this.fail(message(failure));
         }
       } while (this.resync && !this.disposed);
@@ -114,12 +120,41 @@ var SplitController = class {
       this.busy = false;
     }
   };
+  /** Scope the next native workspace selection to the pane that opened its picker. */
+  beginWorkspaceChange = (sourceId) => {
+    if (this.disposed || this.busy || this.nativeTarget !== void 0) return;
+    this.run(() => {
+      this.cancelledWorkspaceTarget = void 0;
+      this.clearWorkspaceChange();
+      if (!this.snapshot.ids.includes(sourceId)) return;
+      this.cancelPlacement();
+      const catalog = this.dependencies.catalog();
+      this.workspaceChange = {
+        sourceId,
+        counts: new Map(catalog.sessions.map((row) => [row.id, mainViewCount(row)])),
+        previousReferences: new Set(this.references.keys()),
+        initialCurrent: this.current
+      };
+    });
+  };
+  cancelWorkspaceChange = () => {
+    if (this.disposed || this.busy) return;
+    this.run(() => {
+      const pending = this.workspaceChange;
+      if (pending?.target !== void 0 && pending.target === this.current && !this.snapshot.ids.includes(pending.target)) {
+        this.cancelledWorkspaceTarget = { id: pending.target, retainedAgain: false };
+      }
+      this.clearWorkspaceChange();
+    });
+  };
   /** Add an explicitly dropped conversation without changing native selection. */
   addHistory = (id, target) => {
     if (this.disposed || this.busy || this.nativeTarget !== void 0) return;
     if (target !== void 0 && (!target || !isSnapTarget(target))) return;
-    if (target === void 0 && this.snapshot.ids.includes(id)) return;
     this.run(() => {
+      this.cancelledWorkspaceTarget = void 0;
+      this.clearWorkspaceChange();
+      if (target === void 0 && this.snapshot.ids.includes(id)) return;
       const catalog = this.dependencies.catalog();
       if (!catalog.ready) return;
       const known = new Set(catalog.sessions.map((row) => row.id));
@@ -184,6 +219,8 @@ var SplitController = class {
   close = (id) => {
     if (this.disposed || this.busy || !this.snapshot.ids.includes(id)) return;
     this.run(() => {
+      this.cancelledWorkspaceTarget = void 0;
+      this.clearWorkspaceChange();
       this.cancelPlacement();
       const remaining = this.snapshot.ids.filter((value) => value !== id);
       if (remaining.length < 2) {
@@ -207,6 +244,8 @@ var SplitController = class {
   exit = (id) => {
     if (this.disposed || this.busy) return;
     this.run(() => {
+      this.cancelledWorkspaceTarget = void 0;
+      this.clearWorkspaceChange();
       const target = id ?? (this.current !== void 0 && this.snapshot.ids.includes(this.current) ? this.current : this.snapshot.ids[0] ?? this.current);
       if (target !== void 0 && !this.dependencies.catalog().sessions.some((row) => row.id === target)) {
         this.fail("This conversation is no longer available.");
@@ -219,6 +258,8 @@ var SplitController = class {
   dispose = () => {
     if (this.disposed) return;
     this.disposed = true;
+    this.cancelledWorkspaceTarget = void 0;
+    this.clearWorkspaceChange();
     this.cancelPlacement();
     const unsubscribe = this.unsubscribeCatalog;
     this.unsubscribeCatalog = void 0;
@@ -250,7 +291,19 @@ var SplitController = class {
         if (rows.get(candidate)?.blank !== true) this.candidates.delete(candidate);
       }
     }
-    const main = catalog.sessions.filter((row) => row.mainView);
+    const main = catalog.sessions.filter((row) => mainViewCount(row) > 0);
+    if (this.workspaceChange !== void 0 && this.readWorkspaceChange(catalog, main)) return;
+    const cancelled = this.cancelledWorkspaceTarget;
+    if (cancelled !== void 0) {
+      if (main.some((row) => row.id === cancelled.id && mainViewCount(row) > 1)) cancelled.retainedAgain = true;
+      if (main.length === 1 && mainViewCount(main[0]) === 1) {
+        if (main[0].id !== cancelled.id) this.cancelledWorkspaceTarget = void 0;
+        else if (cancelled.retainedAgain) {
+          this.cancelledWorkspaceTarget = void 0;
+          this.current = void 0;
+        }
+      }
+    }
     const selected = main.some((row) => row.id === this.current) ? this.current : main.length === 1 ? main[0].id : void 0;
     if (selected === void 0) return;
     if (this.nativeTarget !== void 0) {
@@ -322,6 +375,73 @@ var SplitController = class {
     this.restore();
     this.publish(error === void 0 ? { ids: [] } : { ids: [], error });
     if (retained) this.releaseExcept(/* @__PURE__ */ new Set([selected]));
+  }
+  readWorkspaceChange(catalog, main) {
+    const pending = this.workspaceChange;
+    if (!catalog.ready) return true;
+    if (!this.snapshot.ids.includes(pending.sourceId)) {
+      this.clearWorkspaceChange();
+      return false;
+    }
+    const incoming = main.find((row) => mainViewCount(row) > (pending.counts.get(row.id) ?? 0));
+    pending.target ??= incoming?.id;
+    if (pending.target !== void 0 && !catalog.sessions.some((row) => row.id === pending.target)) {
+      this.clearWorkspaceChange();
+      this.candidates.clear();
+      if (main.length === 1 && mainViewCount(main[0]) === 1) this.current = main[0].id;
+      this.fail("This conversation is no longer available.");
+      return true;
+    }
+    if (main.length !== 1 || mainViewCount(main[0]) !== 1) return true;
+    const selected = main[0].id;
+    if (pending.target === void 0 && selected !== pending.initialCurrent) pending.target = selected;
+    if (pending.target === void 0) return true;
+    if (selected !== pending.target) {
+      this.clearWorkspaceChange();
+      this.candidates.clear();
+      return false;
+    }
+    this.current = selected;
+    this.candidates.clear();
+    if (selected === pending.sourceId) {
+      this.clearWorkspaceChange();
+      return true;
+    }
+    if (pending.reference === void 0) {
+      if (!this.acquire([selected])) {
+        this.clearWorkspaceChange();
+        return true;
+      }
+      pending.reference = this.references.get(selected);
+      void pending.reference.ready.then(() => {
+        if (this.disposed || this.workspaceChange !== pending) return;
+        pending.ready = true;
+        this.syncCatalog();
+      }, (failure) => {
+        if (this.disposed || this.workspaceChange !== pending) return;
+        this.run(() => {
+          this.clearWorkspaceChange();
+          this.fail(message(failure));
+        });
+      });
+    }
+    if (!pending.ready) return true;
+    const visible = this.snapshot.ids.includes(selected);
+    const replace = (id) => id === pending.sourceId ? selected : visible && id === selected ? pending.sourceId : id;
+    const placement = this.snapshot.placement;
+    const ids = visible && placement ? this.snapshot.ids : this.snapshot.ids.map((id) => replace(id));
+    this.workspaceChange = void 0;
+    this.publish({ ids, ...placement ? {
+      placement: { layout: placement.layout, slots: placement.slots.map(replace) }
+    } : {} });
+    this.releaseExcept(new Set(ids));
+    return true;
+  }
+  clearWorkspaceChange() {
+    const pending = this.workspaceChange;
+    if (pending === void 0) return;
+    this.workspaceChange = void 0;
+    this.releaseExcept(pending.previousReferences);
   }
   returnNative(target, navigate) {
     if (target !== void 0 && !this.acquire([target])) return;
@@ -626,6 +746,23 @@ var HistoryDrag = class {
   }
 };
 
+// src/workspace-switch.ts
+function isWorkspaceChoice(pane, target) {
+  const element = target;
+  if (typeof element?.closest !== "function") return false;
+  const item = element.closest('button[role="menuitem"]');
+  if (item === null || item.hasAttribute("disabled") || item.getAttribute("aria-disabled") === "true") return false;
+  return [...pane.querySelectorAll('[data-slot="conversation.hero.workspace"]')].some((slot) => {
+    const anchor = slot.previousElementSibling;
+    return anchor?.matches('button[aria-haspopup="menu"][aria-expanded="true"]') === true;
+  });
+}
+function supersedesWorkspaceChoice(target) {
+  const element = target;
+  if (typeof element?.closest !== "function") return false;
+  return element.closest('[data-snap-session], [role="dialog"]') === null;
+}
+
 // src/styles.ts
 var dashboardStyles = `
 .dsh-snap-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:minmax(0,1fr); gap:8px; padding:8px; flex:1; min-height:0; height:100%; box-sizing:border-box; overflow:hidden; color:var(--dsw-alias-label-primary); background:var(--dsw-alias-bg-base); }
@@ -739,7 +876,20 @@ function SessionPane({ id, title, controller, SessionProvider, renderSlot, t, st
       live = false;
     };
   }, [reference]);
-  return /* @__PURE__ */ import_react.default.createElement("section", { className: "dsh-snap-pane", "aria-label": title, "data-snap-session": id, style }, /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-pane-tools" }, /* @__PURE__ */ import_react.default.createElement("button", { type: "button", className: "dsh-snap-icon", title: t("single"), "aria-label": `${t("single")}: ${title}`, onClick: () => controller.exit(id) }, "\u25A1"), /* @__PURE__ */ import_react.default.createElement("button", { type: "button", className: "dsh-snap-icon", title: t("close"), "aria-label": `${t("close")}: ${title}`, onClick: () => controller.close(id) }, "\xD7")), error !== void 0 ? /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-message", role: "alert" }, t("failed"), " ", error) : ready && reference !== void 0 ? /* @__PURE__ */ import_react.default.createElement(SessionProvider, { session: reference }, renderSlot(CHAT_SLOT, {})) : /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-message", role: "status" }, t("opening")));
+  return /* @__PURE__ */ import_react.default.createElement(
+    "section",
+    {
+      className: "dsh-snap-pane",
+      "aria-label": title,
+      "data-snap-session": id,
+      style,
+      onClickCapture: (event) => {
+        if (isWorkspaceChoice(event.currentTarget, event.target)) controller.beginWorkspaceChange(id);
+      }
+    },
+    /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-pane-tools" }, /* @__PURE__ */ import_react.default.createElement("button", { type: "button", className: "dsh-snap-icon", title: t("single"), "aria-label": `${t("single")}: ${title}`, onClick: () => controller.exit(id) }, "\u25A1"), /* @__PURE__ */ import_react.default.createElement("button", { type: "button", className: "dsh-snap-icon", title: t("close"), "aria-label": `${t("close")}: ${title}`, onClick: () => controller.close(id) }, "\xD7")),
+    error !== void 0 ? /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-message", role: "alert" }, t("failed"), " ", error) : ready && reference !== void 0 ? /* @__PURE__ */ import_react.default.createElement(SessionProvider, { session: reference }, renderSlot(CHAT_SLOT, {})) : /* @__PURE__ */ import_react.default.createElement("div", { className: "dsh-snap-message", role: "status" }, t("opening"))
+  );
 }
 function SplitView({ controller, historyDrag, useSessions, SessionProvider, renderSlot, t }) {
   const state = (0, import_react.useSyncExternalStore)(controller.subscribe, controller.getSnapshot);
@@ -831,7 +981,8 @@ function apply(ctx) {
       return { ready: list.phase === "ready", sessions: Object.values(list.byId).map((row) => ({
         id: row.id,
         blank: row.blank && row.origin !== "subagent",
-        mainView: (row.retainedBy.mainView ?? 0) > 0
+        mainView: (row.retainedBy.mainView ?? 0) > 0,
+        mainViewCount: row.retainedBy.mainView ?? 0
       })) };
     },
     subscribeCatalog: (callback) => ctx.sessions.list.subscribe(callback),
@@ -857,6 +1008,21 @@ function apply(ctx) {
     add: (id, target) => controller.addHistory(id, target)
   });
   actions = { controller, historyDrag };
+  ctx.effect(() => {
+    const click = (event) => {
+      if (supersedesWorkspaceChoice(event.target)) controller.cancelWorkspaceChange();
+    };
+    const key = (event) => {
+      const navigate = (event.ctrlKey || event.metaKey) && ["KeyN", "KeyK", "KeyO"].includes(event.code);
+      if (event.key === "Escape" || navigate) controller.cancelWorkspaceChange();
+    };
+    window.addEventListener("click", click, true);
+    window.addEventListener("keydown", key, true);
+    return () => {
+      window.removeEventListener("click", click, true);
+      window.removeEventListener("keydown", key, true);
+    };
+  }, "split: workspace navigation intent");
   ctx.effect(() => () => historyDrag.dispose(), "split: history drag lifetime");
   ctx.effect(() => () => controller.dispose(), "split: controller lifetime");
   ctx.slots.inject(CHAT_SLOT, () => ctx.slots.register({ name: CHAT_SLOT, locale: NS }, EmbeddedChat));

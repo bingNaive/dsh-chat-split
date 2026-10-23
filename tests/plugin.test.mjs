@@ -60,6 +60,7 @@ function setup() {
   const catalogListeners = new Set();
   const navigations = [];
   const forbiddenRequests = [];
+  const readiness = new Map();
   const once = callback => {
     let live = true;
     return () => { if (live) { live = false; callback?.(); } };
@@ -131,7 +132,7 @@ function setup() {
         subscribe(listener) { catalogListeners.add(listener); return () => catalogListeners.delete(listener); },
       },
       retain(id, options) {
-        const ref = { sessionId: id, ready: Promise.resolve(), released: 0, release() { ref.released += 1; } };
+        const ref = { sessionId: id, ready: readiness.get(id) ?? Promise.resolve(), released: 0, release() { ref.released += 1; } };
         references.push({ id, options, ref });
         return ref;
       },
@@ -151,6 +152,7 @@ function setup() {
   return {
     ...runtime, plugin, registrations, references, dictionaries, overlay, actions,
     controller: actions.controller, catalogListeners, navigations, forbiddenRequests,
+    readiness,
     get state() { return state; },
     get main() { return registrations.get('main:conversation'); },
     get chat() { return [...registrations.values()].find(entry => entry.options.name === Object.keys(this.main?.options.children ?? {})[0]); },
@@ -163,6 +165,14 @@ function setup() {
       if (main) select(id);
     },
     select,
+    workspaceSelect(id, beforeOpen = () => {}) {
+      state = { ...state, byId: { ...state.byId, [id]: {
+        ...state.byId[id], retainedBy: { mainView: (state.byId[id].retainedBy.mainView ?? 0) + 1 },
+      } } };
+      emit();
+      beforeOpen();
+      select(id);
+    },
     dispose: once(() => { for (const effect of effects.reverse()) effect(); }),
   };
 }
@@ -182,6 +192,139 @@ function embeddedProps(harness, renderFactorySlot) {
     renderFactorySlot,
   };
 }
+
+function chooseWorkspace(harness, renderer, source) {
+  // The native menu is portalled outside the pane, but its React capture event
+  // still reaches the originating SessionPane after the window capture listener.
+  const item = { hasAttribute: () => false, getAttribute: () => null };
+  const target = { closest: selector => selector === 'button[role="menuitem"]' ? item : null };
+  const currentTarget = { querySelectorAll: () => [{ previousElementSibling: { matches: () => true } }] };
+  harness.events.emit('click', { target });
+  renderer.root.findByProps({ 'data-snap-session': source }).props.onClickCapture({ currentTarget, target });
+}
+
+async function renderSplit(harness) {
+  let renderer;
+  await act(async () => {
+    renderer = TestRenderer.create(React.createElement(harness.main.component, {
+      ...harness.actions, t: translate, useSessions: selector => selector(harness.state),
+      SessionProvider: ({ session, children }) => React.createElement('div', { 'data-reference': session.sessionId }, children),
+      renderSlot: () => null,
+    }));
+  });
+  return renderer;
+}
+
+for (const reused of [false, true]) {
+  test(`native workspace picker replaces only its pane and keeps a four-cell layout (${reused ? 'reused' : 'new'} blank)`, async () => {
+    const harness = setup();
+    let renderer;
+    try {
+      if (reused) harness.add('project-blank');
+      await act(async () => { harness.controller.addHistory('history', { layout: 'grid', slot: 3 }); });
+      harness.add('source-blank', { main: true });
+      harness.select('alpha'); // The picker belongs to a pane other than native main.
+      renderer = await renderSplit(harness);
+      const sourceRef = harness.controller.ref('source-blank');
+      const alphaRef = harness.controller.ref('alpha');
+      const historyRef = harness.controller.ref('history');
+      await act(async () => {
+        chooseWorkspace(harness, renderer, 'source-blank');
+        harness.events.emit('keydown', { key: 'v', code: 'KeyV', ctrlKey: true });
+        if (!reused) harness.add('project-blank');
+        harness.workspaceSelect('project-blank', () => {
+          assert.equal(sourceRef.released, 0, 'The source draft must remain retained until native beforeOpen transfers it.');
+          assert.ok(harness.main, 'The split must stay mounted during native navigation.');
+        });
+      });
+      assert.deepEqual([...harness.controller.getSnapshot().placement.slots], ['alpha', 'project-blank', null, 'history']);
+      assert.equal(harness.controller.getSnapshot().placement.layout, 'grid');
+      assert.equal(renderer.root.findAllByProps({ className: 'dsh-snap-empty' }).length, 1);
+      assert.equal(sourceRef.released, 1);
+      assert.equal(harness.controller.ref('alpha'), alphaRef);
+      assert.equal(harness.controller.ref('history'), historyRef);
+      assert.deepEqual(harness.navigations, []);
+      assert.equal(harness.forbiddenRequests.length, 0);
+    } finally {
+      await act(async () => { renderer?.unmount(); });
+      harness.dispose();
+    }
+    assert.ok(harness.references.every(value => value.ref.released === 1));
+  });
+}
+
+test('workspace choice targeting the already-current visible blank uses native retain counts and swaps cells', async () => {
+  const harness = setup();
+  let renderer;
+  try {
+    await act(async () => { harness.controller.addHistory('history', { layout: 'grid', slot: 3 }); });
+    harness.add('source-blank', { main: true });
+    harness.add('target-blank', { main: true });
+    renderer = await renderSplit(harness);
+    const originalRefs = harness.references.filter(value => value.ref.released === 0);
+    await act(async () => {
+      chooseWorkspace(harness, renderer, 'source-blank');
+      harness.workspaceSelect('target-blank'); // mainView for this ID changes 1 -> 2 -> 1.
+    });
+    assert.deepEqual([...harness.controller.getSnapshot().placement.slots], ['alpha', 'target-blank', 'source-blank', 'history']);
+    assert.ok(originalRefs.every(value => value.ref.released === 0));
+    assert.equal(harness.references.length, originalRefs.length);
+  } finally {
+    await act(async () => { renderer?.unmount(); });
+    harness.dispose();
+  }
+});
+
+for (const dismiss of ['sidebar click', 'Escape', 'New shortcut']) {
+  test(`abandoned workspace choice is cleared by ${dismiss} so ordinary history navigation still works`, async () => {
+    const harness = setup();
+    let renderer;
+    try {
+      splitFromNativeNew(harness);
+      renderer = await renderSplit(harness);
+      chooseWorkspace(harness, renderer, 'native-new');
+      if (dismiss === 'Escape') harness.events.emit('keydown', { key: 'Escape' });
+      else if (dismiss === 'New shortcut') harness.events.emit('keydown', { key: 'n', code: 'KeyN', ctrlKey: true });
+      else harness.events.emit('click', { target: { closest: () => null } });
+      await act(async () => { harness.select('history'); });
+      assert.equal(harness.main, undefined);
+      assert.deepEqual([...harness.controller.getSnapshot().ids], []);
+      assert.equal(harness.controller.ref('history').released, 0);
+    } finally {
+      await act(async () => { renderer?.unmount(); });
+      harness.dispose();
+    }
+  });
+}
+
+test('clicking the same destination in the sidebar while a workspace pane is loading opens it normally', async () => {
+  const harness = setup();
+  let renderer;
+  let ready;
+  try {
+    splitFromNativeNew(harness);
+    renderer = await renderSplit(harness);
+    harness.add('slow-project');
+    harness.readiness.set('slow-project', new Promise(resolve => { ready = resolve; }));
+    await act(async () => {
+      chooseWorkspace(harness, renderer, 'native-new');
+      harness.workspaceSelect('slow-project');
+    });
+    assert.deepEqual([...harness.controller.getSnapshot().ids], ['alpha', 'native-new']);
+    await act(async () => {
+      harness.events.emit('click', { target: { closest: () => null } });
+      harness.workspaceSelect('slow-project');
+    });
+    assert.equal(harness.main, undefined);
+    assert.equal(harness.controller.ref('slow-project').released, 0);
+    await act(async () => { ready(); });
+    assert.deepEqual([...harness.controller.getSnapshot().ids], []);
+  } finally {
+    ready?.();
+    await act(async () => { renderer?.unmount(); });
+    harness.dispose();
+  }
+});
 
 test('browser artifact remains lazy and imports only host-shared React', () => {
   const loader = loadBundle();

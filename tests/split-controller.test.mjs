@@ -35,7 +35,7 @@ function fixture(options = {}) {
   let controller;
   const emit = () => { for (const listener of [...listeners]) listener(); };
   const select = (id) => {
-    catalog = { ...catalog, sessions: catalog.sessions.map(value => ({ ...value, mainView: value.id === id })) };
+    catalog = { ...catalog, sessions: catalog.sessions.map(value => ({ ...value, mainView: value.id === id, mainViewCount: value.id === id ? 1 : 0 })) };
     emit();
   };
   controller = new SplitController({
@@ -87,6 +87,11 @@ function fixture(options = {}) {
     set(rows, ready = catalog.ready) { catalog = { ready, sessions: rows }; emit(); },
     add(id, blank = true) { catalog = { ...catalog, sessions: [...catalog.sessions, row(id, blank)] }; emit(); },
     select, emit,
+    retainNative(id) {
+      this.set(this.catalog.sessions.map(value => value.id === id ? {
+        ...value, mainView: true, mainViewCount: (value.mainViewCount ?? (value.mainView ? 1 : 0)) + 1,
+      } : value));
+    },
     newSession(id) {
       this.add(id);
       this.set(this.catalog.sessions.map(value => value.id === id ? { ...value, mainView: true } : value));
@@ -955,4 +960,396 @@ test('targeted layouts settle through reentrant catalog notifications without du
   unsubscribe();
   f.controller.dispose();
   assert.ok(f.records.every(record => record.releases === 1));
+});
+
+test('workspace selection replaces its source with an existing or newly created blank, without appending a pane', async () => {
+  for (const existing of [true, false]) {
+    const f = fixture({ reentrant: true });
+    if (existing) f.add('workspace-draft');
+    f.newSession('beta');
+    const other = f.controller.ref('alpha');
+    const before = f.controller.getSnapshot();
+    f.controller.beginWorkspaceChange('beta');
+    if (!existing) f.add('workspace-draft');
+    f.retainNative('workspace-draft');
+    assert.equal(f.controller.getSnapshot(), before, 'native beforeOpen has not completed');
+    assert.equal(f.records.find(record => record.id === 'beta').releases, 0);
+    f.select('workspace-draft');
+    assert.equal(f.controller.getSnapshot(), before, 'wait for destination readiness before releasing source');
+    await settlePlacement();
+    assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'workspace-draft'] });
+    assert.equal(f.controller.ref('alpha'), other);
+    assert.deepEqual(f.held, ['alpha', 'workspace-draft']);
+    assert.equal(f.active, 1);
+    assert.equal(f.events.some(event => event[0] === 'open' || event[0] === 'deactivate'), false);
+    f.controller.dispose();
+    assert.ok(f.records.every(record => record.releases === 1));
+  }
+});
+
+test('workspace selection is scoped to a noncurrent pane and keeps every grid slot', async () => {
+  for (const full of [false, true]) {
+    const f = fixture();
+    f.newSession('beta');
+    if (full) f.newSession('gamma');
+    f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+    await settlePlacement();
+    const before = f.controller.getSnapshot();
+    const retained = new Map(before.ids.filter(id => id !== 'alpha').map(id => [id, f.controller.ref(id)]));
+    f.controller.beginWorkspaceChange('alpha');
+    f.add('workspace-draft');
+    f.retainNative('workspace-draft');
+    f.select('workspace-draft');
+    await settlePlacement();
+    assert.deepEqual(f.controller.getSnapshot(), {
+      ids: before.ids.map(id => id === 'alpha' ? 'workspace-draft' : id),
+      placement: { layout: 'grid', slots: before.placement.slots.map(id => id === 'alpha' ? 'workspace-draft' : id) },
+    });
+    for (const [id, ref] of retained) assert.equal(f.controller.ref(id), ref);
+    assert.equal(f.records.find(record => record.id === 'alpha').releases, 1);
+    f.controller.dispose();
+  }
+});
+
+test('switching to a visible draft swaps panes without duplicates, even if it is already native current', async () => {
+  for (const explicit of [false, true]) {
+    for (const alreadyCurrent of [false, true]) {
+      const f = fixture();
+      f.newSession('beta');
+      f.newSession('gamma');
+      if (explicit) {
+        f.controller.addHistory('beta', { layout: 'grid', slot: 3 });
+        await settlePlacement();
+      }
+      const target = alreadyCurrent ? 'gamma' : 'beta';
+      const before = f.controller.getSnapshot();
+      const refs = [...f.records];
+      f.controller.beginWorkspaceChange('alpha');
+      f.retainNative(target);
+      await settlePlacement();
+      assert.equal(f.controller.getSnapshot(), before, 'the same-current 1 -> 2 retain is not a completed switch');
+      f.select(target);
+      await settlePlacement();
+      const swap = id => id === 'alpha' ? target : id === target ? 'alpha' : id;
+      assert.deepEqual(f.controller.getSnapshot(), {
+        ids: explicit ? before.ids : before.ids.map(swap),
+        ...(explicit ? { placement: { layout: 'grid', slots: before.placement.slots.map(swap) } } : {}),
+      });
+      assert.deepEqual(f.records, refs);
+      assert.ok(refs.every(record => record.releases === 0));
+      f.controller.dispose();
+    }
+  }
+});
+
+test('workspace selection of the source itself is a no-op and clears the pending operation', async () => {
+  const f = fixture();
+  f.newSession('beta');
+  const before = f.controller.getSnapshot();
+  f.controller.beginWorkspaceChange('beta');
+  f.retainNative('beta');
+  f.select('beta');
+  await settlePlacement();
+  assert.equal(f.controller.getSnapshot(), before);
+  f.newSession('gamma');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta', 'gamma'] });
+  f.controller.dispose();
+});
+
+test('workspace change waits for asynchronous loading and native beforeOpen before releasing the source', async () => {
+  const f = fixture({ reentrant: true });
+  f.newSession('beta');
+  const ready = deferred();
+  f.readiness.set('workspace-draft', ready);
+  const before = f.controller.getSnapshot();
+  const source = f.records.find(record => record.id === 'alpha');
+  f.controller.beginWorkspaceChange('alpha');
+  f.add('workspace-draft');
+  f.retainNative('workspace-draft');
+  await settlePlacement();
+  assert.equal(f.controller.ref('workspace-draft'), undefined, 'native beforeOpen still owns the migration');
+  f.select('workspace-draft');
+  await settlePlacement();
+  assert.equal(f.controller.getSnapshot(), before);
+  assert.equal(source.releases, 0);
+  ready.resolve();
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['workspace-draft', 'beta'] });
+  assert.equal(source.releases, 1);
+  f.controller.dispose();
+});
+
+test('workspace destination loading errors preserve the source pane and clean up staged references', async () => {
+  for (const failure of ['retain', 'readiness']) {
+    const f = fixture({ reentrant: true });
+    f.newSession('beta');
+    const before = f.controller.getSnapshot();
+    const ready = deferred();
+    if (failure === 'retain') f.failures.set('workspace-draft', new Error('workspace load failed'));
+    else f.readiness.set('workspace-draft', ready);
+    f.controller.beginWorkspaceChange('alpha');
+    f.add('workspace-draft');
+    f.retainNative('workspace-draft');
+    f.select('workspace-draft');
+    if (failure === 'readiness') ready.reject(new Error('workspace load failed'));
+    await settlePlacement();
+    assert.deepEqual(f.controller.getSnapshot(), { ...before, error: 'workspace load failed' });
+    assert.deepEqual(f.held, ['alpha', 'beta']);
+    f.emit();
+    assert.deepEqual(f.controller.getSnapshot().ids, before.ids);
+    f.newSession('gamma');
+    assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta', 'gamma'] });
+    f.controller.dispose();
+    assert.ok(f.records.every(record => record.releases === 1));
+  }
+});
+
+test('cancelled workspace selection leaves native New and sidebar navigation unchanged', () => {
+  for (const action of ['new', 'history']) {
+    const f = fixture();
+    f.newSession('beta');
+    f.controller.beginWorkspaceChange('alpha');
+    f.controller.cancelWorkspaceChange();
+    if (action === 'new') {
+      f.newSession('gamma');
+      assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta', 'gamma'] });
+    } else {
+      f.select('history');
+      assert.deepEqual(f.controller.getSnapshot(), { ids: [] });
+      assert.deepEqual(f.held, ['history']);
+    }
+    f.controller.dispose();
+  }
+});
+
+test('close, exit, drag, cancellation and disposal invalidate pending workspace readiness', async () => {
+  for (const action of ['close', 'exit', 'drag', 'cancel', 'dispose']) {
+    const f = fixture({ autoOpen: true });
+    f.newSession('beta');
+    f.newSession('gamma');
+    const ready = deferred();
+    f.readiness.set('workspace-draft', ready);
+    f.controller.beginWorkspaceChange('alpha');
+    f.add('workspace-draft');
+    f.retainNative('workspace-draft');
+    f.select('workspace-draft');
+    if (action === 'close') f.controller.close('alpha');
+    if (action === 'exit') f.controller.exit('beta');
+    if (action === 'drag') f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+    if (action === 'cancel') f.controller.cancelWorkspaceChange();
+    if (action === 'dispose') f.controller.dispose();
+    await settlePlacement();
+    const before = f.controller.getSnapshot();
+    assert.equal(f.controller.ref('workspace-draft'), undefined);
+    ready.resolve();
+    await settlePlacement();
+    assert.equal(f.controller.getSnapshot(), before, action);
+    f.controller.dispose();
+    assert.ok(f.records.every(record => record.releases === 1));
+  }
+});
+
+test('beginning a workspace change cancels a pending drag so its later commit cannot release the source', async () => {
+  const f = fixture();
+  f.newSession('beta');
+  const dragReady = deferred();
+  f.readiness.set('history', dragReady);
+  f.controller.addHistory('history', { layout: 'columns', slot: 0 });
+  f.controller.beginWorkspaceChange('alpha');
+  const before = f.controller.getSnapshot();
+  dragReady.resolve();
+  await settlePlacement();
+  assert.equal(f.controller.getSnapshot(), before);
+  assert.deepEqual(f.held, ['alpha', 'beta']);
+  f.add('workspace-draft');
+  f.retainNative('workspace-draft');
+  f.select('workspace-draft');
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['workspace-draft', 'beta'] });
+  f.controller.dispose();
+});
+
+test('workspace selection supports batched native catalog updates and legacy boolean catalogs', async () => {
+  const f = fixture();
+  f.newSession('beta');
+  f.controller.beginWorkspaceChange('alpha');
+  f.set([row('alpha', true), row('beta', true), row('workspace-draft', true, true)]);
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['workspace-draft', 'beta'] });
+  f.controller.dispose();
+});
+
+test('workspace loading waits through a temporarily unavailable catalog and recovers on readiness', async () => {
+  const f = fixture();
+  f.newSession('beta');
+  f.controller.beginWorkspaceChange('alpha');
+  f.add('workspace-draft');
+  f.retainNative('workspace-draft');
+  f.select('workspace-draft');
+  f.set(f.catalog.sessions, false);
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta'] });
+  assert.deepEqual(f.held, ['alpha', 'beta', 'workspace-draft']);
+  f.set(f.catalog.sessions, true);
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['workspace-draft', 'beta'] });
+  f.controller.dispose();
+});
+
+test('native single view and unknown sources cannot start a workspace replacement', async () => {
+  const f = fixture();
+  f.controller.beginWorkspaceChange('alpha');
+  f.newSession('beta');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta'] });
+  f.controller.beginWorkspaceChange('missing');
+  f.select('history');
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: [] });
+  f.controller.dispose();
+});
+
+test('a deleted workspace destination cannot leave a pending replacement blocking later navigation', async () => {
+  for (const selected of [false, true]) {
+    const f = fixture({ reentrant: true });
+    f.newSession('beta');
+    const ready = deferred();
+    f.readiness.set('workspace-draft', ready);
+    f.controller.beginWorkspaceChange('alpha');
+    f.add('workspace-draft');
+    f.retainNative('workspace-draft');
+    if (selected) f.select('workspace-draft');
+    f.set(f.catalog.sessions.filter(value => value.id !== 'workspace-draft').map(value => ({
+      ...value, mainView: value.id === 'beta', mainViewCount: value.id === 'beta' ? 1 : 0,
+    })));
+    await settlePlacement();
+    assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta'], error: 'This conversation is no longer available.' });
+    assert.deepEqual(f.held, ['alpha', 'beta']);
+    const before = f.controller.getSnapshot();
+    ready.resolve();
+    await settlePlacement();
+    assert.equal(f.controller.getSnapshot(), before);
+    f.select('history');
+    assert.deepEqual(f.controller.getSnapshot(), { ids: [] });
+    assert.deepEqual(f.held, ['history']);
+    f.controller.dispose();
+  }
+});
+
+test('native workspace rollback cancels the pending source and does not consume the next New', async () => {
+  const f = fixture({ reentrant: true });
+  f.newSession('beta');
+  f.controller.beginWorkspaceChange('alpha');
+  f.add('workspace-draft');
+  f.retainNative('workspace-draft');
+  f.select('beta');
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta'] });
+  f.newSession('gamma');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta', 'gamma'] });
+  f.controller.dispose();
+});
+
+test('catalog errors cancel a staged workspace change and ignore late readiness', async () => {
+  const f = fixture({ reentrant: true });
+  f.newSession('beta');
+  const ready = deferred();
+  f.readiness.set('workspace-draft', ready);
+  f.controller.beginWorkspaceChange('alpha');
+  f.add('workspace-draft');
+  f.retainNative('workspace-draft');
+  f.select('workspace-draft');
+  f.setCatalogFailure(new Error('catalog unavailable'));
+  f.emit();
+  const before = f.controller.getSnapshot();
+  assert.deepEqual(before, { ids: ['alpha', 'beta'], error: 'catalog unavailable' });
+  assert.deepEqual(f.held, ['alpha', 'beta']);
+  f.setCatalogFailure(undefined);
+  ready.resolve();
+  await settlePlacement();
+  f.emit();
+  assert.equal(f.controller.getSnapshot(), before);
+  f.newSession('gamma');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta', 'gamma'] });
+  f.controller.dispose();
+});
+
+test('a newer workspace selection supersedes old loading without releasing a visible source', async () => {
+  const f = fixture({ reentrant: true });
+  f.newSession('beta');
+  const old = deferred();
+  f.readiness.set('old-workspace', old);
+  f.controller.beginWorkspaceChange('alpha');
+  f.add('old-workspace');
+  f.retainNative('old-workspace');
+  f.select('old-workspace');
+  f.controller.beginWorkspaceChange('beta');
+  assert.deepEqual(f.held, ['alpha', 'beta']);
+  f.add('new-workspace');
+  f.retainNative('new-workspace');
+  f.select('new-workspace');
+  await settlePlacement();
+  const before = f.controller.getSnapshot();
+  assert.deepEqual(before, { ids: ['alpha', 'new-workspace'] });
+  old.reject(new Error('stale workspace error'));
+  await settlePlacement();
+  assert.equal(f.controller.getSnapshot(), before);
+  assert.deepEqual(f.held, ['alpha', 'new-workspace']);
+  f.controller.dispose();
+  assert.ok(f.records.every(record => record.releases === 1));
+});
+
+test('cancelling a loading workspace then reopening that same native target shows its native conversation', async () => {
+  const f = fixture({ reentrant: true });
+  f.newSession('beta');
+  const ready = deferred();
+  f.readiness.set('workspace-draft', ready);
+  f.controller.beginWorkspaceChange('alpha');
+  f.add('workspace-draft');
+  f.retainNative('workspace-draft');
+  f.select('workspace-draft');
+  f.controller.cancelWorkspaceChange();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta'] }, 'release reentrancy must not be mistaken for a sidebar re-open');
+  assert.deepEqual(f.held, ['alpha', 'beta']);
+  f.emit();
+  f.controller.cancelWorkspaceChange();
+  f.retainNative('workspace-draft');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta'] }, 'wait until native beforeOpen completes');
+  f.select('workspace-draft');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: [] });
+  assert.deepEqual(f.held, ['workspace-draft']);
+  ready.resolve();
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: [] }, 'cancelled readiness cannot restore the split');
+  f.controller.dispose();
+  assert.ok(f.records.every(record => record.releases === 1));
+});
+
+test('cancelled workspace re-open tracking does not change native New or a subsequent workspace picker', async () => {
+  for (const action of ['new', 'same-target-picker', 'other-target-picker']) {
+    const f = fixture({ reentrant: true });
+    f.newSession('beta');
+    const ready = deferred();
+    f.readiness.set('workspace-draft', ready);
+    f.controller.beginWorkspaceChange('alpha');
+    f.add('workspace-draft');
+    f.retainNative('workspace-draft');
+    f.select('workspace-draft');
+    f.controller.cancelWorkspaceChange();
+    if (action === 'new') {
+      f.newSession('gamma');
+      assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta', 'gamma'] });
+    } else {
+      f.controller.beginWorkspaceChange('beta');
+      const target = action === 'same-target-picker' ? 'workspace-draft' : 'other-workspace';
+      if (action === 'other-target-picker') f.add(target);
+      f.retainNative(target);
+      f.select(target);
+      ready.resolve();
+      await settlePlacement();
+      assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', target] });
+    }
+    ready.resolve();
+    await settlePlacement();
+    f.controller.dispose();
+    assert.ok(f.records.every(record => record.releases === 1));
+  }
 });
