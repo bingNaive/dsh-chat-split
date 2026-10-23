@@ -12,6 +12,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import { SplitController } from './split-controller.js';
 import { HistoryDrag } from './history-drag.js';
 import { dashboardStyles } from './styles.js';
+import { SNAP_LAYOUTS, getSnapLayout, type SnapRect, type SnapTarget } from './snap-layout.js';
 
 const NS = 'multi-agent-dashboard';
 const CHAT_SLOT = 'multi-agent-dashboard.snap-chat';
@@ -19,15 +20,22 @@ const en = {
   split: 'Split conversations', close: 'Close split pane', single: 'Return to single conversation',
   opening: 'Opening conversation…', unavailable: 'This conversation is no longer available.',
   failed: 'Could not open conversation.', missing: 'Harness conversation view is unavailable.',
-  limit: 'Showing the four most recent panes. Earlier conversations remain in the sidebar.',
+  limit: 'The layout is full. Earlier conversations remain in the sidebar.',
   drop: 'Release to add this conversation to split view',
+  choose: 'Drop onto a layout area', empty: 'Empty pane',
+  columns: 'Two columns', 'wide-left': 'Wide left', 'wide-right': 'Wide right',
+  'three-columns': 'Three columns', 'left-stack': 'Left and two stacked', grid: 'Four panes',
+  area: 'Area',
 } as const;
 const zh: Record<keyof typeof en, string> = {
   split: '对话分屏', close: '关闭此分屏', single: '恢复单个对话',
   opening: '正在打开对话…', unavailable: '这个对话已不可用。',
   failed: '无法打开对话。', missing: 'Harness 对话视图当前不可用。',
-  limit: '已保留最近 4 个分屏，之前的对话仍可从侧栏打开。',
+  limit: '已按所选布局显示，移出的对话仍可从侧栏打开。',
   drop: '松开以加入分屏',
+  choose: '拖到布局中的区域', empty: '空闲分屏',
+  columns: '双栏', 'wide-left': '左宽右窄', 'wide-right': '左窄右宽',
+  'three-columns': '三栏', 'left-stack': '一主两副', grid: '四宫格', area: '区域',
 };
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap { 'multi-agent-dashboard': keyof typeof en; }
@@ -58,7 +66,7 @@ function EmbeddedChat({ useSession, useConversation, useSessions, sessionId, ren
     variant: 'embedded', phase: settling ? 'settling' : hero ? 'hero' : 'active', hero,
   }, { slots: { views: ChatView }, fallback: <div className="dsh-snap-message" role="alert">{t('missing')}</div> })}</div>;
 }
-function SessionPane({ id, title, controller, SessionProvider, renderSlot, t }: Pick<SplitProps, 'controller' | 'SessionProvider' | 'renderSlot' | 't'> & { id: string; title: string }) {
+function SessionPane({ id, title, controller, SessionProvider, renderSlot, t, style }: Pick<SplitProps, 'controller' | 'SessionProvider' | 'renderSlot' | 't'> & { id: string; title: string; style?: React.CSSProperties }) {
   const reference = controller.ref(id) as SessionReference | undefined;
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string>();
@@ -68,7 +76,7 @@ function SessionPane({ id, title, controller, SessionProvider, renderSlot, t }: 
     void reference?.ready.then(() => { if (live) setReady(true); }).catch((failure: unknown) => { if (live) setError(String(failure)); });
     return () => { live = false; };
   }, [reference]);
-  return <section className="dsh-snap-pane" aria-label={title} data-snap-session={id}>
+  return <section className="dsh-snap-pane" aria-label={title} data-snap-session={id} style={style}>
     <div className="dsh-snap-pane-tools">
       <button type="button" className="dsh-snap-icon" title={t('single')} aria-label={`${t('single')}: ${title}`} onClick={() => controller.exit(id)}>□</button>
       <button type="button" className="dsh-snap-icon" title={t('close')} aria-label={`${t('close')}: ${title}`} onClick={() => controller.close(id)}>×</button>
@@ -81,10 +89,35 @@ function SessionPane({ id, title, controller, SessionProvider, renderSlot, t }: 
 function SplitView({ controller, useSessions, SessionProvider, renderSlot, t }: SplitProps) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
   const catalog = useSessions(value => value);
-  return <div className="dsh-snap-grid" aria-label={t('split')} data-pane-count={state.ids.length}>
-    {state.ids.map(id => <SessionPane key={id} id={id} title={catalog.byId[id as SessionId]?.displayTitle ?? id}
-      controller={controller} SessionProvider={SessionProvider} renderSlot={renderSlot} t={t} />)}
+  const layout = state.placement && getSnapLayout(state.placement.layout);
+  const cells = state.placement?.slots ?? state.ids;
+  return <div className="dsh-snap-grid" aria-label={t('split')} data-pane-count={state.ids.length} data-snap-layout={layout?.id}>
+    {cells.map((id, index) => {
+      const rect = layout?.cells[index];
+      const style = rect && gridCell(rect);
+      return id === null
+        ? <div key={`empty-${index}`} className="dsh-snap-empty" style={style} aria-label={t('empty')}>{t('empty')}</div>
+        : <SessionPane key={id} id={id} title={catalog.byId[id as SessionId]?.displayTitle ?? id} style={style}
+          controller={controller} SessionProvider={SessionProvider} renderSlot={renderSlot} t={t} />;
+    })}
   </div>;
+}
+function gridCell(rect: SnapRect): React.CSSProperties {
+  return { gridColumn: `${Math.round(rect.x * 12) + 1} / span ${Math.round(rect.width * 12)}`,
+    gridRow: `${Math.round(rect.y * 2) + 1} / span ${Math.round(rect.height * 2)}` };
+}
+function previewCell(rect: SnapRect): React.CSSProperties {
+  return { left: `${rect.x * 100}%`, top: `${rect.y * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%` };
+}
+function LayoutCell({ historyDrag, target, rect, active, label }: {
+  historyDrag: HistoryDrag; target: SnapTarget; rect: SnapRect; active: boolean; label: string;
+}) {
+  const element = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (element.current) return historyDrag.registerTarget(element.current, target);
+  }, [historyDrag, target.layout, target.slot]);
+  return <div ref={element} className="dsh-snap-layout-cell" role="img" aria-label={label}
+    data-snap-active={active || undefined} style={previewCell(rect)} />;
 }
 function HistoryAnchor({ sessionId, historyDrag }: PropsRuntime<'sidebar.workspaces.session.row.action'> & Actions) {
   const marker = useRef<HTMLSpanElement>(null);
@@ -96,6 +129,7 @@ function HistoryAnchor({ sessionId, historyDrag }: PropsRuntime<'sidebar.workspa
 function SplitStatus({ controller, historyDrag, t }: Actions & Localized) {
   const state = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
   const drag = useSyncExternalStore(historyDrag.subscribe, historyDrag.getSnapshot);
+  const preview = drag.target && getSnapLayout(drag.target.layout).cells[drag.target.slot];
   const [dismissed, setDismissed] = useState<string>();
   const notice = state.error ?? (state.notice === 'limit' ? t('limit') : undefined);
   useEffect(() => {
@@ -106,8 +140,17 @@ function SplitStatus({ controller, historyDrag, t }: Actions & Localized) {
   }, [notice, state.error]);
   return <><style>{dashboardStyles}</style>
     {drag.id !== undefined && <div ref={historyDrag.setZone} className="dsh-snap-drop" style={{ left: drag.left }}>
-      <div className="dsh-snap-drop-preview" aria-hidden="true"><span /><span /></div>
-      <div className="dsh-snap-drop-label" role="status">{t('drop')}</div>
+      <div className="dsh-snap-preview-surface" aria-hidden="true">
+        {preview && <div className="dsh-snap-highlight" style={previewCell(preview)} data-preview-layout={drag.target?.layout} data-preview-slot={drag.target?.slot} />}
+      </div>
+      {drag.picker ? <div className="dsh-snap-picker" role="group" aria-label={t('choose')}>
+        <div className="dsh-snap-layouts">{SNAP_LAYOUTS.map(layout => <div key={layout.id} className="dsh-snap-layout" title={t(layout.id)}>
+          {layout.cells.map((rect, slot) => <LayoutCell key={slot} historyDrag={historyDrag} rect={rect} target={{ layout: layout.id, slot }}
+            active={drag.target?.layout === layout.id && drag.target.slot === slot} label={`${t(layout.id)} · ${t('area')} ${slot + 1}`} />)}
+        </div>)}</div>
+        <div className="dsh-snap-picker-caption">{t('choose')}</div>
+      </div> : <div className="dsh-snap-top-hint" aria-hidden="true" />}
+      {preview && <div className="dsh-snap-drop-label" role="status">{t('drop')}</div>}
     </div>}
     {notice !== undefined && dismissed !== notice && <div className="dsh-snap-notice" role={state.error ? 'alert' : 'status'}>{notice}</div>}
   </>;
@@ -137,7 +180,7 @@ export function apply(ctx: Context): void {
       const row = ctx.sessions.list.getSnapshot().byId[id as SessionId];
       return row !== undefined && !row.blank && row.origin !== 'subagent';
     },
-    add: id => controller.addHistory(id),
+    add: (id, target) => controller.addHistory(id, target),
   });
   actions = { controller, historyDrag };
   ctx.effect(() => () => historyDrag.dispose(), 'split: history drag lifetime');

@@ -1,3 +1,5 @@
+import { getSnapLayout, isSnapTarget, type SnapPlacement, type SnapTarget } from './snap-layout';
+
 export interface SplitReference {
   readonly ready: Promise<unknown>;
   release(): void;
@@ -26,6 +28,8 @@ export interface SplitDependencies {
 export interface SplitSnapshot {
   /** An empty array means the native single-conversation view is active. */
   readonly ids: readonly string[];
+  /** Spatial slots are independent of ids, which retain conversation recency order. */
+  readonly placement?: SnapPlacement;
   readonly error?: string;
   readonly notice?: 'limit';
 }
@@ -49,6 +53,7 @@ export class SplitController {
   private busy = false;
   private resync = false;
   private disposed = false;
+  private pendingPlacement: { readonly previousReferences: ReadonlySet<string> } | undefined;
 
   constructor(private readonly dependencies: SplitDependencies) {
     this.syncCatalog();
@@ -80,8 +85,10 @@ export class SplitController {
   };
 
   /** Add an explicitly dropped conversation without changing native selection. */
-  readonly addHistory = (id: string): void => {
-    if (this.disposed || this.busy || this.nativeTarget !== undefined || this.snapshot.ids.includes(id)) return;
+  readonly addHistory = (id: string, target?: SnapTarget): void => {
+    if (this.disposed || this.busy || this.nativeTarget !== undefined) return;
+    if (target !== undefined && (!target || !isSnapTarget(target))) return;
+    if (target === undefined && this.snapshot.ids.includes(id)) return;
     this.run(() => {
       const catalog = this.dependencies.catalog();
       if (!catalog.ready) return;
@@ -92,7 +99,26 @@ export class SplitController {
       }
       const existing = this.snapshot.ids.length > 0 ? this.snapshot.ids
         : this.current !== undefined && known.has(this.current) ? [this.current] : [];
-      if (existing.length === 0 || existing.includes(id)) return;
+      if (existing.length === 0) return;
+      if (target !== undefined) {
+        const capacity = getSnapLayout(target.layout).cells.length;
+        const others = existing.filter(value => value !== id).slice(-(capacity - 1));
+        if (others.length === 0) return;
+        const next = existing.includes(id)
+          ? existing.filter(value => value === id || others.includes(value)) : [...others, id];
+        const slots: (string | null)[] = Array(capacity).fill(null);
+        slots[target.slot] = id;
+        let index = 0;
+        for (let slot = 0; slot < slots.length && index < others.length; slot += 1) {
+          if (slot !== target.slot) slots[slot] = others[index++]!;
+        }
+        const limited = existing.some(value => !next.includes(value));
+        this.stagePlacement({ ids: next, placement: { layout: target.layout, slots }, ...(limited ? { notice: 'limit' as const } : {}) });
+        this.candidates.delete(id);
+        return;
+      }
+      if (existing.includes(id)) return;
+      this.cancelPlacement();
       const limited = existing.length >= 4;
       const next = [...(limited ? existing.slice(-3) : existing), id];
       const previousReferences = new Set(this.references.keys());
@@ -112,12 +138,16 @@ export class SplitController {
   readonly close = (id: string): void => {
     if (this.disposed || this.busy || !this.snapshot.ids.includes(id)) return;
     this.run(() => {
+      this.cancelPlacement();
       const remaining = this.snapshot.ids.filter(value => value !== id);
       if (remaining.length < 2) {
         this.returnNative(remaining[0], true);
         return;
       }
-      this.publish({ ids: remaining });
+      const placement = this.snapshot.placement;
+      this.publish({ ids: remaining, ...(placement ? {
+        placement: { layout: placement.layout, slots: placement.slots.map(value => value === id ? null : value) },
+      } : {}) });
       this.releaseExcept(new Set(remaining));
       if (this.current === id) {
         try { this.dependencies.open(remaining[remaining.length - 1]!); }
@@ -135,6 +165,7 @@ export class SplitController {
         this.fail('This conversation is no longer available.');
         return;
       }
+      this.cancelPlacement();
       this.returnNative(target, true);
     });
   };
@@ -142,6 +173,7 @@ export class SplitController {
   readonly dispose = (): void => {
     if (this.disposed) return;
     this.disposed = true;
+    this.cancelPlacement();
     const unsubscribe = this.unsubscribeCatalog;
     this.unsubscribeCatalog = undefined;
     try { unsubscribe?.(); }
@@ -190,12 +222,13 @@ export class SplitController {
     }
 
     if (selected === this.current) {
-      if (this.snapshot.ids.length === 0 && this.acquire([selected])) {
+      if (this.pendingPlacement === undefined && this.snapshot.ids.length === 0 && this.acquire([selected])) {
         this.releaseExcept(new Set([selected]));
       }
       return;
     }
 
+    this.cancelPlacement();
     const previous = this.current;
     this.current = selected;
     const newBlank = catalog.ready && this.candidates.delete(selected);
@@ -203,6 +236,26 @@ export class SplitController {
     if (newBlank && previous !== undefined && rows.has(previous)) {
       if (this.snapshot.ids.includes(selected)) return;
       const existing = this.snapshot.ids.length > 0 ? this.snapshot.ids : [previous];
+      const placement = this.snapshot.placement;
+      const empty = placement?.slots.indexOf(null) ?? -1;
+      if (placement !== undefined && empty !== -1) {
+        const slots = [...placement.slots];
+        slots[empty] = selected;
+        const next = [...existing, selected];
+        const previousReferences = new Set(this.references.keys());
+        // Native New has already created and selected this draft. Display its
+        // loading pane immediately so subsequent New actions append to it.
+        if (!this.acquire(next)) return;
+        try { this.deactivate ??= this.dependencies.activate(); }
+        catch (failure) {
+          this.releaseExcept(previousReferences);
+          this.fail(message(failure));
+          return;
+        }
+        this.publish({ ids: next, placement: { layout: placement.layout, slots } });
+        this.releaseExcept(new Set(next));
+        return;
+      }
       const limited = existing.length >= 4;
       const next = [...(limited ? existing.slice(-3) : existing), selected];
       if (this.acquire(next)) {
@@ -240,6 +293,51 @@ export class SplitController {
       catch (failure) { this.fail(message(failure)); }
     }
     this.resync = true;
+  }
+
+  /** Commit explicit layouts only after every conversation is usable. */
+  private stagePlacement(next: SplitSnapshot): void {
+    this.cancelPlacement();
+    const pending = { previousReferences: new Set(this.references.keys()) };
+    this.pendingPlacement = pending;
+    if (!this.acquire(next.ids)) {
+      this.cancelPlacement();
+      return;
+    }
+    const ready = next.ids.map(id => this.references.get(id)!.ready);
+    void Promise.all(ready).then(() => {
+      if (this.disposed || this.pendingPlacement !== pending) return;
+      this.run(() => {
+        try {
+          const catalog = this.dependencies.catalog();
+          if (!catalog.ready || next.ids.some(id => !catalog.sessions.some(row => row.id === id))) {
+            throw new Error('This conversation is no longer available.');
+          }
+          this.deactivate ??= this.dependencies.activate();
+        }
+        catch (failure) {
+          this.cancelPlacement();
+          this.fail(message(failure));
+          return;
+        }
+        this.pendingPlacement = undefined;
+        this.publish(next);
+        this.releaseExcept(new Set(next.ids));
+      });
+    }, (failure: unknown) => {
+      if (this.disposed || this.pendingPlacement !== pending) return;
+      this.run(() => {
+        this.cancelPlacement();
+        this.fail(message(failure));
+      });
+    });
+  }
+
+  private cancelPlacement(): void {
+    const pending = this.pendingPlacement;
+    if (pending === undefined) return;
+    this.pendingPlacement = undefined;
+    this.releaseExcept(pending.previousReferences);
   }
 
   private acquire(ids: readonly string[]): boolean {

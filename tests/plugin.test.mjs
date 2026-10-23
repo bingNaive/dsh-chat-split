@@ -313,3 +313,71 @@ test('global overlay adds no replacement New button or draggable UI', async () =
     harness.dispose();
   }
 });
+
+test('selected snap layout places conversations into the requested cells and keeps empty cells available', async () => {
+  const harness = setup();
+  let renderer;
+  try {
+    await act(async () => { harness.controller.addHistory('history', { layout: 'grid', slot: 3 }); });
+    assert.ok(harness.main);
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(harness.main.component, {
+        ...harness.actions, t: translate, useSessions: selector => selector(harness.state),
+        SessionProvider: ({ session, children }) => React.createElement('div', { 'data-reference': session.sessionId }, children),
+        renderSlot: () => null,
+      }));
+    });
+    assert.equal(renderer.root.findByProps({ className: 'dsh-snap-grid' }).props['data-snap-layout'], 'grid');
+    const history = renderer.root.findByProps({ 'data-snap-session': 'history' });
+    assert.deepEqual({ ...history.props.style }, { gridColumn: '7 / span 6', gridRow: '2 / span 1' });
+    assert.equal(renderer.root.findAllByProps({ className: 'dsh-snap-empty' }).length, 2);
+    await act(async () => { harness.add('native-new', { main: true }); });
+    assert.equal(renderer.root.findAllByProps({ className: 'dsh-snap-empty' }).length, 1);
+    assert.equal(renderer.root.findByProps({ 'data-snap-session': 'history' }).props.style.gridColumn, '7 / span 6');
+    assert.equal(harness.forbiddenRequests.length, 0);
+  } finally {
+    await act(async () => { renderer?.unmount(); });
+    harness.dispose();
+  }
+});
+
+test('drag overlay highlights one target and only exposes layout choices during a top drag', async () => {
+  const harness = setup();
+  let snapshot = { id: 'history', left: 280, target: { layout: 'columns', slot: 0 }, picker: false };
+  const listeners = new Set();
+  const targets = new Map();
+  let zone;
+  const historyDrag = {
+    getSnapshot: () => snapshot,
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    setZone(element) { zone = element; },
+    registerTarget(element, target) { targets.set(element, target); return () => targets.delete(element); },
+  };
+  const update = value => { snapshot = value; for (const listener of listeners) listener(); };
+  let renderer;
+  try {
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(harness.overlay.component, {
+        controller: harness.controller, historyDrag, t: translate,
+      }), { createNodeMock: () => ({}) });
+    });
+    assert.ok(zone);
+    assert.equal(renderer.root.findByProps({ className: 'dsh-snap-highlight' }).props.style.left, '0%');
+    assert.equal(targets.size, 0);
+    await act(async () => { update({ ...snapshot, target: { layout: 'columns', slot: 1 } }); });
+    assert.equal(renderer.root.findByProps({ className: 'dsh-snap-highlight' }).props.style.left, '50%');
+    await act(async () => { update({ ...snapshot, picker: true, target: { layout: 'grid', slot: 2 } }); });
+    assert.equal(targets.size, 16);
+    assert.equal(renderer.root.findAllByProps({ 'data-snap-active': true }).length, 1);
+    assert.equal(renderer.root.findByProps({ className: 'dsh-snap-highlight' }).props.style.top, '50%');
+    await act(async () => { update({ ...snapshot, target: undefined }); });
+    assert.equal(renderer.root.findAllByProps({ className: 'dsh-snap-highlight' }).length, 0);
+    await act(async () => { update({}); });
+    assert.equal(targets.size, 0);
+    assert.equal(zone, null);
+    assert.equal(renderer.root.findAllByProps({ className: 'dsh-snap-picker' }).length, 0);
+  } finally {
+    await act(async () => { renderer?.unmount(); });
+    harness.dispose();
+  }
+});

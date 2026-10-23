@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "dsh-chat-split",
-    "description": "Click New Session or drag a past conversation to chat side by side."
+    "description": "Split new chats automatically, or drag a conversation to choose its position and layout."
   }
 }

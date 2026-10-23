@@ -554,3 +554,296 @@ test('history drops handle synchronous catalog notifications and are inert after
   assert.equal(f.events.length, eventCount);
   assert.ok(f.records.every(record => record.releases === 1));
 });
+
+// Promise.all plus its commit/rejection callback must settle before inspecting a drop.
+const settlePlacement = () => new Promise(resolve => setImmediate(resolve));
+
+test('every snap layout places dropped history into its selected slot and keeps the latest other panes', async () => {
+  const capacities = { columns: 2, 'wide-left': 2, 'wide-right': 2, 'three-columns': 3, 'left-stack': 3, grid: 4 };
+  for (const [layout, capacity] of Object.entries(capacities)) {
+    for (let slot = 0; slot < capacity; slot += 1) {
+      const f = fixture();
+      for (const id of ['beta', 'gamma', 'delta']) f.newSession(id);
+      const before = f.controller.getSnapshot();
+      const oldReferences = new Map(before.ids.map(id => [id, f.controller.ref(id)]));
+      f.controller.addHistory('history', { layout, slot });
+      assert.equal(f.controller.getSnapshot(), before, 'retain existing layout until reference readiness');
+      assert.equal(f.records.find(record => record.id === 'alpha').releases, 0);
+      await settlePlacement();
+      const others = ['alpha', 'beta', 'gamma', 'delta'].slice(-(capacity - 1));
+      const slots = [...others];
+      slots.splice(slot, 0, 'history');
+      assert.deepEqual(f.controller.getSnapshot(), {
+        ids: [...others, 'history'], placement: { layout, slots }, notice: 'limit',
+      });
+      assert.deepEqual(f.held, [...others, 'history'].sort());
+      for (const id of others) assert.equal(f.controller.ref(id), oldReferences.get(id));
+      assert.equal(f.events.some(event => event[0] === 'open'), false);
+      assert.equal(f.catalog.sessions.length, 5, 'rearranging or trimming never deletes conversations');
+      f.controller.dispose();
+      assert.ok(f.records.every(record => record.releases === 1));
+    }
+  }
+});
+
+test('targeted drop starts with native current draft and retains empty layout slots', async () => {
+  const f = fixture();
+  const original = f.controller.ref('alpha');
+  f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'history'], placement: { layout: 'grid', slots: ['alpha', null, null, 'history'] },
+  });
+  assert.equal(f.controller.ref('alpha'), original);
+  assert.equal(f.active, 1);
+  f.controller.dispose();
+});
+
+test('targeting a visible conversation moves it without changing recency or duplicating references', async () => {
+  const f = fixture();
+  for (const id of ['beta', 'gamma', 'delta']) f.newSession(id);
+  const before = [...f.records];
+  f.controller.addHistory('beta', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'beta', 'gamma', 'delta'],
+    placement: { layout: 'grid', slots: ['alpha', 'gamma', 'delta', 'beta'] },
+  });
+  assert.deepEqual(f.records, before);
+  f.controller.addHistory('alpha', { layout: 'columns', slot: 1 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'delta'], placement: { layout: 'columns', slots: ['delta', 'alpha'] }, notice: 'limit',
+  });
+  assert.deepEqual(f.held, ['alpha', 'delta']);
+  assert.equal(f.records.length, before.length);
+  f.controller.dispose();
+});
+
+test('invalid snap targets and a drop of the sole current conversation are no-ops', async () => {
+  const f = fixture();
+  const before = f.controller.getSnapshot();
+  for (const target of [null, {}, { layout: 'unknown', slot: 0 }, { layout: 'grid', slot: -1 },
+    { layout: 'grid', slot: 4 }, { layout: 'columns', slot: 2 }, { layout: 'grid', slot: .5 }]) {
+    f.controller.addHistory('history', target);
+  }
+  f.controller.addHistory('alpha', { layout: 'grid', slot: 1 });
+  await settlePlacement();
+  assert.equal(f.controller.getSnapshot(), before);
+  assert.deepEqual(f.events, [['retain', 'alpha']]);
+  f.controller.dispose();
+});
+
+test('native New fills first empty selected-layout slot before reverting to automatic layout at capacity', async () => {
+  const f = fixture();
+  f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  f.newSession('beta');
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'history', 'beta'], placement: { layout: 'grid', slots: ['alpha', 'beta', null, 'history'] },
+  });
+  f.newSession('gamma');
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'history', 'beta', 'gamma'], placement: { layout: 'grid', slots: ['alpha', 'beta', 'gamma', 'history'] },
+  });
+  f.newSession('delta');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['history', 'beta', 'gamma', 'delta'], notice: 'limit' });
+  f.controller.addHistory('alpha', { layout: 'columns', slot: 0 });
+  await settlePlacement();
+  f.newSession('epsilon');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['delta', 'alpha', 'epsilon'] });
+  f.controller.dispose();
+});
+
+test('closing targeted layout leaves an empty slot and restores native below two conversations', async () => {
+  const f = fixture({ autoOpen: true });
+  for (const id of ['beta', 'gamma']) f.newSession(id);
+  f.controller.addHistory('history', { layout: 'grid', slot: 2 });
+  await settlePlacement();
+  f.controller.close('gamma');
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'beta', 'history'], placement: { layout: 'grid', slots: ['alpha', 'beta', 'history', null] },
+  });
+  f.controller.close('alpha');
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['beta', 'history'], placement: { layout: 'grid', slots: [null, 'beta', 'history', null] },
+  });
+  f.newSession('fresh');
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot().placement, { layout: 'grid', slots: ['fresh', 'beta', 'history', null] });
+  f.controller.close('history');
+  f.controller.close('fresh');
+  assert.deepEqual(f.controller.getSnapshot(), { ids: [] });
+  assert.deepEqual(f.held, ['beta']);
+  assert.equal(f.active, 0);
+  f.controller.dispose();
+});
+
+test('targeted retention and activation failures preserve the previous layout and its references', async () => {
+  const f = fixture();
+  for (const id of ['beta', 'gamma']) f.newSession(id);
+  f.controller.addHistory('beta', { layout: 'grid', slot: 2 });
+  await settlePlacement();
+  const placement = f.controller.getSnapshot().placement;
+  f.failures.set('history', new Error('retain denied'));
+  f.controller.addHistory('history', { layout: 'columns', slot: 0 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta', 'gamma'], placement, error: 'retain denied' });
+  assert.deepEqual(f.held, ['alpha', 'beta', 'gamma']);
+  f.controller.dispose();
+  const native = fixture({ reentrant: true });
+  native.setActivationFailure(new Error('activation denied'));
+  native.controller.addHistory('history', { layout: 'columns', slot: 0 });
+  await settlePlacement();
+  assert.deepEqual(native.controller.getSnapshot(), { ids: [], error: 'activation denied' });
+  assert.deepEqual(native.held, ['alpha']);
+  assert.equal(native.active, 0);
+  native.controller.dispose();
+});
+
+test('asynchronous readiness failure rolls back only staged references and never releases visible panes', async () => {
+  const f = fixture({ reentrant: true });
+  for (const id of ['beta', 'gamma', 'delta']) f.newSession(id);
+  const ready = deferred();
+  f.readiness.set('history', ready);
+  const before = f.controller.getSnapshot();
+  f.controller.addHistory('history', { layout: 'columns', slot: 1 });
+  await settlePlacement();
+  assert.equal(f.controller.getSnapshot(), before);
+  assert.deepEqual(f.held, ['alpha', 'beta', 'delta', 'gamma', 'history']);
+  ready.reject(new Error('load failed'));
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ids: ['alpha', 'beta', 'gamma', 'delta'], error: 'load failed' });
+  assert.deepEqual(f.held, ['alpha', 'beta', 'delta', 'gamma']);
+  assert.equal(f.active, 1);
+  f.controller.dispose();
+});
+
+test('native New readiness failure reports the error while preserving the created draft in its slot', async () => {
+  const f = fixture();
+  f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  const ready = deferred();
+  f.readiness.set('beta', ready);
+  f.newSession('beta');
+  const next = {
+    ids: ['alpha', 'history', 'beta'], placement: { layout: 'grid', slots: ['alpha', 'beta', null, 'history'] },
+  };
+  assert.deepEqual(f.controller.getSnapshot(), next);
+  ready.reject(new Error('new conversation failed'));
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), { ...next, error: 'new conversation failed' });
+  assert.deepEqual(f.held, ['alpha', 'beta', 'history']);
+  f.controller.dispose();
+});
+
+test('rapid native New actions keep both drafts in empty snap slots while the first draft is loading', async () => {
+  const f = fixture({ reentrant: true });
+  f.controller.addHistory('history', { layout: 'grid', slot: 3 });
+  await settlePlacement();
+  const beta = deferred();
+  const gamma = deferred();
+  f.readiness.set('beta', beta);
+  f.readiness.set('gamma', gamma);
+  f.newSession('beta');
+  const betaReference = f.controller.ref('beta');
+  f.newSession('gamma');
+  const expected = {
+    ids: ['alpha', 'history', 'beta', 'gamma'],
+    placement: { layout: 'grid', slots: ['alpha', 'beta', 'gamma', 'history'] },
+  };
+  assert.deepEqual(f.controller.getSnapshot(), expected);
+  assert.deepEqual(f.held, ['alpha', 'beta', 'gamma', 'history']);
+  gamma.resolve();
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), expected);
+  beta.resolve();
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), expected);
+  assert.equal(f.controller.ref('beta'), betaReference);
+  assert.equal(f.records.filter(record => record.id === 'beta').length, 1);
+  f.controller.dispose();
+  assert.ok(f.records.every(record => record.releases === 1));
+});
+
+test('navigation, close, exit and disposal cancel pending targeted drops without late reactivation', async () => {
+  for (const action of ['navigate', 'close', 'exit', 'dispose']) {
+    const f = fixture({ autoOpen: true });
+    for (const id of ['beta', 'gamma']) f.newSession(id);
+    f.add('other', false);
+    const ready = deferred();
+    f.readiness.set('history', ready);
+    f.controller.addHistory('history', { layout: 'columns', slot: 0 });
+    if (action === 'navigate') f.select('other');
+    if (action === 'close') f.controller.close('alpha');
+    if (action === 'exit') f.controller.exit('beta');
+    if (action === 'dispose') f.controller.dispose();
+    const before = f.controller.getSnapshot();
+    assert.equal(f.controller.ref('history'), undefined);
+    ready.resolve();
+    await settlePlacement();
+    assert.equal(f.controller.getSnapshot(), before, action);
+    f.controller.dispose();
+    assert.ok(f.records.every(record => record.releases === 1));
+  }
+});
+
+test('a newer targeted drop supersedes a pending one and ignores its late readiness failure', async () => {
+  const f = fixture();
+  f.add('other', false);
+  const old = deferred();
+  f.readiness.set('history', old);
+  f.controller.addHistory('history', { layout: 'columns', slot: 0 });
+  f.controller.addHistory('other', { layout: 'wide-right', slot: 1 });
+  await settlePlacement();
+  const before = f.controller.getSnapshot();
+  assert.deepEqual(before, { ids: ['alpha', 'other'], placement: { layout: 'wide-right', slots: ['alpha', 'other'] } });
+  old.reject(new Error('stale failure'));
+  await settlePlacement();
+  assert.equal(f.controller.getSnapshot(), before);
+  assert.deepEqual(f.held, ['alpha', 'other']);
+  f.controller.dispose();
+});
+
+test('targeted commit rechecks catalog availability and preserves the previous layout on failure', async () => {
+  for (const failure of ['removed', 'not-ready', 'catalog-error']) {
+    const f = fixture();
+    f.newSession('beta');
+    const ready = deferred();
+    f.readiness.set('history', ready);
+    f.controller.addHistory('history', { layout: 'columns', slot: 0 });
+    if (failure === 'removed') f.set(f.catalog.sessions.filter(value => value.id !== 'history'));
+    if (failure === 'not-ready') f.set(f.catalog.sessions, false);
+    if (failure === 'catalog-error') f.setCatalogFailure(new Error('catalog unavailable'));
+    ready.resolve();
+    await settlePlacement();
+    assert.deepEqual(f.controller.getSnapshot().ids, ['alpha', 'beta']);
+    assert.equal(typeof f.controller.getSnapshot().error, 'string');
+    assert.deepEqual(f.held, ['alpha', 'beta']);
+    f.controller.dispose();
+  }
+});
+
+test('targeted layouts settle through reentrant catalog notifications without duplicate lifetimes', async () => {
+  const f = fixture({ reentrant: true, autoOpen: true });
+  const unsubscribe = f.controller.subscribe(() => {
+    f.controller.syncCatalog();
+    f.controller.addHistory('history', { layout: 'columns', slot: 0 });
+  });
+  f.controller.addHistory('history', { layout: 'grid', slot: 2 });
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot(), {
+    ids: ['alpha', 'history'], placement: { layout: 'grid', slots: ['alpha', null, 'history', null] },
+  });
+  assert.equal(f.records.length, 2);
+  assert.equal(f.active, 1);
+  f.newSession('beta');
+  await settlePlacement();
+  assert.deepEqual(f.controller.getSnapshot().placement, { layout: 'grid', slots: ['alpha', 'beta', 'history', null] });
+  assert.equal(f.records.length, 3);
+  unsubscribe();
+  f.controller.dispose();
+  assert.ok(f.records.every(record => record.releases === 1));
+});

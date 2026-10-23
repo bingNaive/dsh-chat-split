@@ -11,9 +11,12 @@ const { HistoryDrag } = await import(`data:text/javascript;base64,${Buffer.from(
 const MIME = 'application/x-harness-chatsplit-session';
 
 function element(children = [], right = 268) {
+  const rect = { left: 0, top: 0, right, bottom: 800 };
   return {
+    children,
+    setRect(bounds) { Object.assign(rect, bounds); },
     contains(candidate) { return this === candidate || children.some(child => child.contains(candidate)); },
-    getBoundingClientRect() { return { right }; },
+    getBoundingClientRect() { return { ...rect, width: rect.right - rect.left, height: rect.bottom - rect.top }; },
   };
 }
 
@@ -29,6 +32,7 @@ function transfer() {
 function fixture() {
   const listeners = new Map();
   const events = {
+    innerWidth: 1280, innerHeight: 800,
     addEventListener(type, callback, capture = false) {
       const entries = listeners.get(type) ?? [];
       entries.push({ callback, capture });
@@ -39,7 +43,7 @@ function fixture() {
     },
     emit(type, values = {}, nativeHandler = () => {}) {
       const event = {
-        target: null, button: 0, clientX: 0, clientY: 0,
+        target: null, relatedTarget: null, button: 0, clientX: 500, clientY: 300,
         defaultPrevented: false, propagationStopped: false,
         preventDefault() { this.defaultPrevented = true; },
         stopPropagation() { this.propagationStopped = true; },
@@ -56,26 +60,37 @@ function fixture() {
   const row = element([title, marker]);
   const preview = element();
   const zone = element([preview]);
+  zone.setRect({ left: 280, right: 1280 });
   const outside = element();
   const dataTransfer = transfer();
   const available = new Set(['history']);
   let allowed = true;
   const added = [];
+  const placements = [];
   const drag = new HistoryDrag({
     events, available: id => available.has(id), allowed: () => allowed,
-    add: id => added.push(id),
+    add: (id, target) => { added.push(id); placements.push(target); },
   });
   const unanchor = drag.anchor(marker, 'history');
   drag.setZone(zone);
   return {
-    events, drag, title, marker, row, zone, preview, outside, dataTransfer, available, added, unanchor,
+    events, drag, title, marker, row, zone, preview, outside, dataTransfer, available, added, placements, unanchor,
     setAllowed(value) { allowed = value; },
     down(values = {}) { return events.emit('pointerdown', { target: title, clientX: 60, clientY: 100, ...values }); },
     start(values = {}, nativeHandler) {
       return events.emit('dragstart', { target: row, clientX: 80, clientY: 102, dataTransfer, ...values }, nativeHandler);
     },
     begin() { this.down(); return this.start(); },
+    over(values = {}) { return events.emit('dragover', { target: preview, dataTransfer, ...values }); },
     drop(values = {}) { return events.emit('drop', { target: preview, dataTransfer, ...values }); },
+    cell(target, bounds) {
+      const child = element();
+      const cell = element([child]);
+      cell.setRect(bounds);
+      zone.children.push(cell);
+      const unregister = drag.registerTarget(cell, target);
+      return { cell, child, unregister };
+    },
   };
 }
 
@@ -103,7 +118,7 @@ test('rightward history drag uses the registered row identity and adds only on a
   f.drop();
   f.events.emit('dragend');
   assert.deepEqual(f.added, ['history'], 'Duplicate drop/end events must not add twice.');
-  assert.equal(notifications, 2);
+  assert.equal(notifications, 3);
   unsubscribe();
   f.drag.dispose();
 });
@@ -251,4 +266,223 @@ test('disposal removes capture listeners and clears the active gesture', () => {
   assert.equal(f.start().propagationStopped, false);
   assert.equal(f.drop().propagationStopped, false);
   assert.deepEqual(f.added, []);
+});
+
+test('left and right halves preview and place exactly at the horizontal seam', () => {
+  for (const [x, slot] of [[280, 0], [779.9, 0], [780, 1], [1279.9, 1]]) {
+    const f = fixture();
+    f.begin();
+    f.over({ clientX: x, clientY: 124 });
+    assert.deepEqual(f.drag.getSnapshot().target, { layout: 'columns', slot });
+    assert.equal(f.drag.getSnapshot().picker, undefined);
+    assert.equal(f.dataTransfer.dropEffect, 'copy');
+    f.drop({ clientX: x, clientY: 124 });
+    assert.deepEqual(f.placements, [{ layout: 'columns', slot }]);
+    f.drag.dispose();
+  }
+});
+
+test('top strip shows the layout picker but whitespace never accepts a drop', () => {
+  for (const [x, y] of [[280, 0], [500, 10], [1100, 70], [600, 123.9]]) {
+    const f = fixture();
+    f.begin();
+    f.over({ clientX: x, clientY: y });
+    assert.equal(f.drag.getSnapshot().picker, true);
+    assert.equal(f.drag.getSnapshot().target, undefined);
+    assert.equal(f.dataTransfer.dropEffect, 'none');
+    f.drop({ clientX: x, clientY: y });
+    assert.deepEqual(f.added, []);
+    assert.deepEqual(f.drag.getSnapshot(), {});
+    f.drag.dispose();
+  }
+});
+
+test('each owned mini-cell previews its layout and slot, including descendant targets', () => {
+  const layouts = { columns: 2, 'wide-left': 2, 'wide-right': 2, 'three-columns': 3, 'left-stack': 3, grid: 4 };
+  for (const [layout, count] of Object.entries(layouts)) {
+    for (let slot = 0; slot < count; slot += 1) {
+      const f = fixture();
+      const target = { layout, slot };
+      const { child } = f.cell(target, { left: 400, right: 450, top: 24, bottom: 80 });
+      f.begin();
+      f.over({ clientX: 420, clientY: 50, target: child });
+      assert.deepEqual(f.drag.getSnapshot().target, target);
+      assert.equal(f.drag.getSnapshot().picker, true);
+      assert.equal(f.dataTransfer.dropEffect, 'copy');
+      f.drop({ clientX: 420, clientY: 50, target: child });
+      assert.deepEqual(f.placements, [target]);
+      f.drag.dispose();
+    }
+  }
+});
+
+test('picker cell hit tests require both registered ownership and actual bounds', () => {
+  for (const scenario of ['wrong-element', 'outside-cell', 'right-edge', 'bottom-edge', 'unregistered', 'detached']) {
+    const f = fixture();
+    const { cell, child, unregister } = f.cell({ layout: 'grid', slot: 3 }, { left: 400, right: 450, top: 24, bottom: 80 });
+    const point = { clientX: 420, clientY: 50, target: child };
+    if (scenario === 'wrong-element') point.target = f.preview;
+    if (scenario === 'outside-cell') point.clientX = 399;
+    if (scenario === 'right-edge') point.clientX = 450;
+    if (scenario === 'bottom-edge') point.clientY = 80;
+    if (scenario === 'unregistered') unregister();
+    if (scenario === 'detached') f.zone.children.splice(f.zone.children.indexOf(cell), 1);
+    f.begin();
+    f.over(point);
+    assert.equal(f.drag.getSnapshot().target, undefined, scenario);
+    assert.equal(f.dataTransfer.dropEffect, 'none', scenario);
+    f.drop(point);
+    assert.deepEqual(f.added, [], scenario);
+    f.drag.dispose();
+  }
+});
+
+test('leaving a mini-cell for a picker gap clears only selection, entering body closes picker', () => {
+  const f = fixture();
+  const { child } = f.cell({ layout: 'grid', slot: 3 }, { left: 400, right: 450, top: 24, bottom: 80 });
+  f.begin();
+  f.over({ target: child, clientX: 420, clientY: 50 });
+  f.over({ clientX: 500, clientY: 100 });
+  assert.equal(f.drag.getSnapshot().picker, true);
+  assert.equal(f.drag.getSnapshot().target, undefined);
+  f.over({ clientX: 1000, clientY: 300 });
+  assert.equal(f.drag.getSnapshot().picker, undefined);
+  assert.deepEqual(f.drag.getSnapshot().target, { layout: 'columns', slot: 1 });
+  f.drag.dispose();
+});
+
+test('drop recomputes placement from release coordinates rather than retaining stale preview', () => {
+  const f = fixture();
+  f.begin();
+  f.over({ clientX: 500, clientY: 300 });
+  f.drop({ clientX: 1000, clientY: 300 });
+  assert.deepEqual(f.placements, [{ layout: 'columns', slot: 1 }]);
+  f.drag.dispose();
+
+  const gap = fixture();
+  const { child } = gap.cell({ layout: 'grid', slot: 2 }, { left: 400, right: 450, top: 24, bottom: 80 });
+  gap.begin();
+  gap.over({ target: child, clientX: 420, clientY: 50 });
+  gap.drop({ clientX: 500, clientY: 70 });
+  assert.deepEqual(gap.added, [], 'Release into a gap must not use the previously highlighted mini-cell.');
+  gap.drag.dispose();
+});
+
+test('release without dragover computes directional or registered mini-cell placement', () => {
+  const f = fixture();
+  f.begin();
+  f.drop({ clientX: 1000, clientY: 300 });
+  assert.deepEqual(f.placements, [{ layout: 'columns', slot: 1 }]);
+  f.drag.dispose();
+
+  const picker = fixture();
+  const target = { layout: 'left-stack', slot: 2 };
+  const { child } = picker.cell(target, { left: 400, right: 450, top: 24, bottom: 80 });
+  picker.begin();
+  picker.drop({ target: child, clientX: 420, clientY: 50 });
+  assert.deepEqual(picker.placements, [target]);
+  picker.drag.dispose();
+});
+
+test('resize and shifted chat area use current geometry on drop', () => {
+  const f = fixture();
+  f.begin();
+  f.over({ clientX: 700, clientY: 300 });
+  assert.equal(f.drag.getSnapshot().target.slot, 0);
+  f.zone.setRect({ left: 280, right: 1000, top: 50, bottom: 700 });
+  f.drop({ clientX: 700, clientY: 300 });
+  assert.deepEqual(f.placements, [{ layout: 'columns', slot: 1 }]);
+  f.drag.dispose();
+
+  const shifted = fixture();
+  shifted.zone.setRect({ top: 100, bottom: 700 });
+  shifted.begin();
+  shifted.over({ clientY: 223 });
+  assert.equal(shifted.drag.getSnapshot().picker, true, 'Top activation is relative to the chat area.');
+  shifted.over({ clientY: 224 });
+  assert.equal(shifted.drag.getSnapshot().target.slot, 0);
+  shifted.zone.setRect({ right: 400 });
+  shifted.drop({ clientX: 500, clientY: 300 });
+  assert.deepEqual(shifted.added, [], 'A now-outside release cannot use a stale accepted area.');
+  shifted.drag.dispose();
+});
+
+test('outside zone geometry clears preview even when the event target is still owned', () => {
+  for (const point of [
+    { clientX: 279 }, { clientX: 1280 }, { clientY: -1 }, { clientY: 800 },
+    { clientX: Number.NaN }, { clientY: Number.POSITIVE_INFINITY }, { target: 'outside' },
+  ]) {
+    const f = fixture();
+    f.begin();
+    f.over();
+    if (point.target === 'outside') point.target = f.outside;
+    f.over(point);
+    assert.equal(f.drag.getSnapshot().id, 'history');
+    assert.equal(f.drag.getSnapshot().target, undefined);
+    assert.equal(f.drag.getSnapshot().picker, undefined);
+    assert.equal(f.dataTransfer.dropEffect, 'none');
+    f.drop(point);
+    assert.deepEqual(f.added, []);
+    f.drag.dispose();
+  }
+});
+
+test('missing transfer or permission/session changes cancel active previews safely', () => {
+  for (const [change, values] of [
+    [f => f.setAllowed(false), {}],
+    [f => f.available.clear(), {}],
+    [() => {}, { dataTransfer: null }],
+  ]) {
+    const f = fixture();
+    f.begin();
+    f.over();
+    change(f);
+    f.over(values);
+    assert.deepEqual(f.drag.getSnapshot(), {});
+    f.drop();
+    assert.deepEqual(f.added, []);
+    f.drag.dispose();
+  }
+  const start = fixture();
+  start.down();
+  assert.equal(start.start({ dataTransfer: null }).propagationStopped, false);
+  assert.deepEqual(start.drag.getSnapshot(), {});
+  start.drag.dispose();
+  const drop = fixture();
+  drop.begin();
+  drop.over();
+  drop.drop({ dataTransfer: null });
+  assert.deepEqual(drop.added, []);
+  assert.deepEqual(drop.drag.getSnapshot(), {});
+  drop.drag.dispose();
+});
+
+test('true window exit cancels, while dragleave between descendants does not flicker', () => {
+  const f = fixture();
+  f.begin();
+  f.over();
+  const before = f.drag.getSnapshot();
+  f.events.emit('dragleave', { target: f.preview, relatedTarget: f.zone, clientX: 0, clientY: 0 });
+  assert.equal(f.drag.getSnapshot(), before);
+  f.events.emit('dragleave', { target: f.preview, relatedTarget: null, clientX: 500, clientY: 300 });
+  assert.equal(f.drag.getSnapshot(), before);
+  f.events.emit('dragleave', { relatedTarget: null, clientX: 1280, clientY: 300 });
+  assert.deepEqual(f.drag.getSnapshot(), {});
+  f.drop();
+  assert.deepEqual(f.added, []);
+  f.drag.dispose();
+});
+
+test('unregistered cell and disposed target registrations cannot restore a stale picker selection', () => {
+  const f = fixture();
+  const { child, unregister } = f.cell({ layout: 'grid', slot: 0 }, { left: 400, right: 450, top: 24, bottom: 80 });
+  f.begin();
+  f.over({ target: child, clientX: 420, clientY: 50 });
+  unregister();
+  f.drop({ target: child, clientX: 420, clientY: 50 });
+  assert.deepEqual(f.added, []);
+  f.drag.dispose();
+  const cleanup = f.drag.registerTarget(child, { layout: 'columns', slot: 0 });
+  cleanup();
+  assert.equal(f.events.listenerCount, 0);
 });
